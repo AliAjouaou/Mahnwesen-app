@@ -36,7 +36,7 @@ async function loadData(){
 
     DATA.leereAktenVermerke = {};
     (vermerkeRes.data || []).forEach(v=>{
-      DATA.leereAktenVermerke[v.jahr + '-' + v.nummer] = { keineRechnung: v.keine_rechnung, grund: v.grund || "", datum: v.datum };
+      DATA.leereAktenVermerke[v.jahr + '-' + v.nummer] = { keineRechnung: v.keine_rechnung, grund: v.grund || "", datum: v.datum, wer: v.wer || "" };
     });
 
     const mahnungenByRe = {};
@@ -86,7 +86,7 @@ async function saveData(){
     await supabaseClient.from('leere_akten_vermerke').delete().neq('jahr', -1);
     const vermerkeRows = Object.entries(DATA.leereAktenVermerke || {}).map(([key, v])=>{
       const [jahr, nummer] = key.split('-').map(Number);
-      return { jahr, nummer, keine_rechnung: true, grund: v.grund || "", datum: v.datum || null };
+      return { jahr, nummer, keine_rechnung: true, grund: v.grund || "", datum: v.datum || null, wer: v.wer || null };
     });
     if(vermerkeRows.length) await supabaseClient.from('leere_akten_vermerke').insert(vermerkeRows);
 
@@ -287,7 +287,7 @@ function addInvoiceNotiz(rechnungsnummer, text){
 // Vermerk automatisch bedeutungslos, da die Zeile dann keine Lücke mehr ist.
 function setKeineRechnungVermerk(year, num, grund){
   DATA.leereAktenVermerke = DATA.leereAktenVermerke || {};
-  DATA.leereAktenVermerke[year+'-'+num] = { keineRechnung:true, grund:(grund||'').trim(), datum: todayISO() };
+  DATA.leereAktenVermerke[year+'-'+num] = { keineRechnung:true, grund:(grund||'').trim(), datum: todayISO(), wer: currentKuerzel() };
   saveData();
   renderAll();
 }
@@ -1112,7 +1112,7 @@ function renderMandanten(){
         <div class="mandant-row" data-toggle="${panelId}">
           <span class="az-tag"${azTagStyleGap}>${n}/${yearShort}</span>
           <span class="mandant-name"></span>
-          <span class="akte-meta" style="font-style:italic;">${isNoRe ? 'Keine Rechnung erwartet' + (vermerk.grund ? ` – ${escapeHtml(vermerk.grund)}` : '') : '– kein Vorgang hinterlegt –'}</span>
+          <span class="akte-meta" style="font-style:italic;">${isNoRe ? 'Keine Rechnung erwartet' + (vermerk.grund ? ` – ${escapeHtml(vermerk.grund)}` : '') + (vermerk.wer ? ` (${escapeHtml(vermerk.wer)}, ${fmtDate(vermerk.datum)})` : '') : '– kein Vorgang hinterlegt –'}</span>
           <div class="sums"></div>
           <span class="mandant-caret" id="caret-${panelId}">▾</span>
         </div>
@@ -1449,7 +1449,7 @@ function renderArchiv(){
     if(!v || !v.keineRechnung) return;
     const dash = key.lastIndexOf('-');
     const year = key.slice(0,dash), num = key.slice(dash+1);
-    docs.push({ datum: v.datum, type:'keine_rechnung', betrag:0, aktenzeichen: `${num}/${String(year).slice(2)}`, rechnungsnummer:'–', mandant:'', grund: v.grund||'', synthetic:true });
+    docs.push({ datum: v.datum, type:'keine_rechnung', betrag:0, aktenzeichen: `${num}/${String(year).slice(2)}`, rechnungsnummer:'–', mandant:'', grund: v.grund||'', wer: v.wer||'', synthetic:true });
   });
   docs = docs.filter(d=>{
     if(az && !d.aktenzeichen.toLowerCase().includes(az)) return false;

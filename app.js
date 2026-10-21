@@ -15,12 +15,13 @@ let detailReturnView = 'rechnungen';
    ============================================================ */
 async function loadData(){
   try{
-    const [settingsRes, templatesRes, vermerkeRes, invoicesRes, mahnungenRes, importLogRes] = await Promise.all([
+    const [settingsRes, templatesRes, vermerkeRes, invoicesRes, mahnungenRes, notizenRes, importLogRes] = await Promise.all([
       supabaseClient.from('settings').select('*').eq('id', 1).maybeSingle(),
       supabaseClient.from('templates').select('*'),
       supabaseClient.from('leere_akten_vermerke').select('*'),
       supabaseClient.from('invoices').select('*'),
       supabaseClient.from('mahnungen').select('*').order('datum'),
+      supabaseClient.from('notizen').select('*').order('datum'),
       supabaseClient.from('import_log').select('*').order('timestamp', { ascending: false }).limit(30)
     ]);
 
@@ -40,7 +41,12 @@ async function loadData(){
 
     const mahnungenByRe = {};
     (mahnungenRes.data || []).forEach(m=>{
-      (mahnungenByRe[m.rechnungsnummer] = mahnungenByRe[m.rechnungsnummer] || []).push({ type: m.type, datum: m.datum, betrag: m.betrag, grund: m.grund });
+      (mahnungenByRe[m.rechnungsnummer] = mahnungenByRe[m.rechnungsnummer] || []).push({ type: m.type, datum: m.datum, betrag: m.betrag, grund: m.grund, wer: m.wer || "" });
+    });
+
+    const notizenByRe = {};
+    (notizenRes.data || []).forEach(n=>{
+      (notizenByRe[n.rechnungsnummer] = notizenByRe[n.rechnungsnummer] || []).push({ text: n.text, wer: n.wer || "", datum: n.datum });
     });
 
     DATA.invoices = (invoicesRes.data || []).map(r=>{
@@ -51,13 +57,13 @@ async function loadData(){
         guthaben: r.guthaben, statusdatum: r.statusdatum, email: r.email || "",
         manuellErledigt: !!r.manuell_erledigt, manuellErledigtGrund: r.manuell_erledigt_grund,
         manuellErledigtDatum: r.manuell_erledigt_datum, manuellErledigtBetrag: r.manuell_erledigt_betrag,
-        notiz: r.notiz, mahnungen: mahnungenByRe[r.rechnungsnummer] || []
+        notiz: r.notiz, mahnungen: mahnungenByRe[r.rechnungsnummer] || [], notizen: notizenByRe[r.rechnungsnummer] || []
       };
       computeDerived(inv);
       return inv;
     });
 
-    DATA.importLog = (importLogRes.data || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skippedDetails: l.skipped_details }));
+    DATA.importLog = (importLogRes.data || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skippedDetails: l.skipped_details, wer: l.wer || "" }));
     DATA.lastImport = DATA.importLog[0] ? DATA.importLog[0].timestamp : null;
   }catch(e){ console.warn("Konnte Daten aus der Datenbank nicht laden:", e); showToast("Daten konnten nicht geladen werden: " + e.message); }
   renderAll();
@@ -102,14 +108,23 @@ async function saveData(){
     const mahnungenRows = [];
     DATA.invoices.forEach(i=>{
       (i.mahnungen || []).forEach(m=>{
-        mahnungenRows.push({ rechnungsnummer: i.rechnungsnummer, type: m.type, datum: m.datum, betrag: m.betrag || null, grund: m.grund || null });
+        mahnungenRows.push({ rechnungsnummer: i.rechnungsnummer, type: m.type, datum: m.datum, betrag: m.betrag || null, grund: m.grund || null, wer: m.wer || null });
       });
     });
     if(mahnungenRows.length) await supabaseClient.from('mahnungen').insert(mahnungenRows);
 
+    // Notizen-Verlauf (komplett ersetzen)
+    const notizenRows = [];
+    DATA.invoices.forEach(i=>{
+      (i.notizen || []).forEach(n=>{
+        notizenRows.push({ rechnungsnummer: i.rechnungsnummer, text: n.text, wer: n.wer || null, datum: n.datum });
+      });
+    });
+    if(notizenRows.length) await supabaseClient.from('notizen').insert(notizenRows);
+
     // Import-Verlauf (komplett ersetzen, max. 30 Einträge - siehe handleImportFile)
     await supabaseClient.from('import_log').delete().neq('id', -1);
-    const importLogRows = (DATA.importLog || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skipped_details: l.skippedDetails || [] }));
+    const importLogRows = (DATA.importLog || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skipped_details: l.skippedDetails || [], wer: l.wer || null }));
     if(importLogRows.length) await supabaseClient.from('import_log').insert(importLogRows);
 
     hideSaveFailBanner();
@@ -239,7 +254,7 @@ function markManuellErledigt(rechnungsnummer, grund){
   inv.manuellErledigtBetrag = betrag;
   computeDerived(inv);
   inv.mahnungen = inv.mahnungen || [];
-  inv.mahnungen.push({ type:'manuell_erledigt', datum: todayISO(), betrag, grund: inv.manuellErledigtGrund });
+  inv.mahnungen.push({ type:'manuell_erledigt', datum: todayISO(), betrag, grund: inv.manuellErledigtGrund, wer: currentKuerzel() });
   saveData();
   renderAll();
 }
@@ -255,11 +270,15 @@ function unmarkManuellErledigt(rechnungsnummer){
   saveData();
   renderAll();
 }
-// Freie Notiz/Bemerkung an einer Rechnung (z.B. "mit Erinnerung vorerst abwarten").
-function setInvoiceNotiz(rechnungsnummer, text){
+// Notiz-Verlauf an einer Rechnung: jede neue Notiz kommt dazu (nichts wird überschrieben),
+// mit Kürzel der angemeldeten Person und Zeitpunkt.
+function addInvoiceNotiz(rechnungsnummer, text){
+  const trimmed = (text||'').trim();
+  if(!trimmed) return;
   const inv = DATA.invoices.find(i=>i.rechnungsnummer===rechnungsnummer);
   if(!inv) return;
-  inv.notiz = (text||'').trim();
+  inv.notizen = inv.notizen || [];
+  inv.notizen.push({ text: trimmed, wer: currentKuerzel(), datum: new Date().toISOString() });
   saveData();
   renderAll();
 }
@@ -278,6 +297,20 @@ function clearKeineRechnungVermerk(year, num){
   renderAll();
 }
 function mahnLabel(type){ return type==='mahnung2' ? '2. Mahnung' : type==='mahnung' ? '1. Mahnung' : type==='zahlung' ? 'Zahlung erhalten' : type==='manuell_erledigt' ? 'Manuell erledigt' : type==='keine_rechnung' ? 'Keine Rechnung erwartet' : 'Erinnerung'; }
+// Button-Beschriftung/Tooltip und Verlaufs-Liste für die Notizen einer Rechnung.
+function notizButtonLabel(inv){ const n=(inv.notizen||[]).length; return n ? `📝 Notizen (${n})` : '📝 Notiz'; }
+function notizButtonTitle(inv){
+  const list = inv.notizen||[]; if(!list.length) return '';
+  const last = list[list.length-1];
+  return `${last.wer||'?'}, ${fmtDateTime(last.datum)}: ${last.text}`;
+}
+function renderNotizenListe(inv){
+  const list = inv.notizen||[]; if(!list.length) return '';
+  const items = list.slice().reverse().map(n=>
+    `<div class="hist" style="margin-top:3px;">📝 <strong>${escapeHtml(n.wer||'?')}</strong>, ${fmtDateTime(n.datum)}: ${escapeHtml(n.text)}</div>`
+  ).join('');
+  return items;
+}
 function getMahnStatus(inv){
   if(inv.status === 'beglichen') return null;
   const events = inv.mahnungen || [];
@@ -492,7 +525,8 @@ async function handleImportFile(file){
         guthaben: guthabenRaw!==null ? (parseNumberDE(guthabenRaw) || 0) : (existing ? existing.guthaben||0 : 0),
         statusdatum: toISO(get("Statusdatum")) || (existing ? existing.statusdatum : null),
         email: get("E-Mail Rechnungsempfaenger","E-Mail Rechnungsempfänger","E-Mail") || (existing?existing.email:"") || "",
-        mahnungen: existing ? existing.mahnungen.slice() : []
+        mahnungen: existing ? existing.mahnungen.slice() : [],
+        notizen: existing ? (existing.notizen||[]).slice() : []
       };
       computeDerived(rec);
       // Automatische Zahlungserkennung: ist der offene Betrag gegenüber dem letzten Import gesunken,
@@ -502,7 +536,7 @@ async function handleImportFile(file){
         const betragGezahlt = Math.round((existing.offenerBetrag - rec.offenerBetrag)*100)/100;
         const zahlungNeuerAlsBekannt = rec.statusdatum && (!existing.statusdatum || rec.statusdatum > existing.statusdatum);
         const zahlungsdatum = zahlungNeuerAlsBekannt ? rec.statusdatum : todayISO();
-        rec.mahnungen.push({ type: 'zahlung', datum: zahlungsdatum, betrag: betragGezahlt });
+        rec.mahnungen.push({ type: 'zahlung', datum: zahlungsdatum, betrag: betragGezahlt, wer: currentKuerzel() });
         rec.mahnungen.sort((a,b)=> a.datum.localeCompare(b.datum));
       }
       byId[rec.rechnungsnummer] = rec;
@@ -510,7 +544,7 @@ async function handleImportFile(file){
     });
     DATA.invoices = Object.values(byId);
     DATA.lastImport = new Date().toISOString();
-    DATA.importLog.unshift({ filename: file.name, timestamp: DATA.lastImport, imported, skipped, skippedDetails });
+    DATA.importLog.unshift({ filename: file.name, timestamp: DATA.lastImport, imported, skipped, skippedDetails, wer: currentKuerzel() });
     DATA.importLog = DATA.importLog.slice(0, 30);
     await saveData();
     renderAll();
@@ -529,7 +563,7 @@ document.getElementById('resetBtn').addEventListener('click', async ()=>{
   // keine Rechnungsdaten mehr vorhanden sind. Einstellungen, Textvorlagen und der Login-Name bleiben
   // davon bewusst unberührt (siehe Button-Name "Rechnungsdaten zurücksetzen").
   DATA.invoices = []; DATA.lastImport = null; DATA.importLog = []; DATA.leereAktenVermerke = {};
-  await saveData(); showView('dashboard'); renderAll();
+  await saveData(); logActivity('Rechnungsdaten zurückgesetzt'); showView('dashboard'); renderAll();
 });
 document.getElementById('exportBtn').addEventListener('click', ()=>{
   const rows = DATA.invoices.map(i=>({
@@ -1202,7 +1236,7 @@ function renderMahnwesen(){
           <div class="row-actions" style="flex-wrap:wrap;gap:6px;">
             ${ms.nextStep!=='inkasso' ? `<button class="btn btn-sm" data-remind="${ms.nextStep}" data-id="${escapeHtml(inv.rechnungsnummer)}">${ms.nextStep==='erinnerung'?'Erinnerung senden':mahnLabel(ms.nextStep)+' senden'}</button>` : ''}
             <button class="btn btn-sm" data-erledigt="${escapeHtml(inv.rechnungsnummer)}">Als erledigt markieren</button>
-            <button class="btn btn-sm" data-notiz="${escapeHtml(inv.rechnungsnummer)}" title="${inv.notiz?escapeHtml(inv.notiz):''}">${inv.notiz?'📝 Notiz':'📝 Notiz'}</button>
+            <button class="btn btn-sm" data-notiz="${escapeHtml(inv.rechnungsnummer)}" title="${escapeHtml(notizButtonTitle(inv))}">${notizButtonLabel(inv)}</button>
           </div>
         </td>
       </tr>`;
@@ -1223,10 +1257,9 @@ function renderMahnwesen(){
     el.addEventListener('click', (e)=>{
       e.stopPropagation();
       const id = el.getAttribute('data-notiz');
-      const cur = DATA.invoices.find(i=>i.rechnungsnummer===id);
-      const text = prompt('Notiz für Rechnung ' + id + ':', (cur && cur.notiz) || '');
+      const text = prompt('Neue Notiz für Rechnung ' + id + ' (wird dem Verlauf hinzugefügt):', '');
       if(text === null) return;
-      setInvoiceNotiz(id, text);
+      addInvoiceNotiz(id, text);
     });
   });
   box.querySelectorAll('tr[data-az]').forEach(el=>{
@@ -1340,10 +1373,10 @@ function openAkteDetail(az){
           ` : ''}
           ${canErledigt ? `<button class="btn btn-sm" data-erledigt="${escapeHtml(inv.rechnungsnummer)}">Als erledigt markieren</button>` : ''}
           ${inv.manuellErledigt ? `<button class="btn btn-sm" data-undo-erledigt="${escapeHtml(inv.rechnungsnummer)}">Rückgängig</button>` : ''}
-          <button class="btn btn-sm" data-notiz="${escapeHtml(inv.rechnungsnummer)}" title="${inv.notiz?escapeHtml(inv.notiz):''}">${inv.notiz?'📝 Notiz':'📝 Notiz'}</button>
+          <button class="btn btn-sm" data-notiz="${escapeHtml(inv.rechnungsnummer)}" title="${escapeHtml(notizButtonTitle(inv))}">${notizButtonLabel(inv)}</button>
         </div>
         ${inv.manuellErledigt && inv.manuellErledigtGrund ? `<div class="hist" style="margin-top:4px;">Grund: ${escapeHtml(inv.manuellErledigtGrund)}</div>` : ''}
-        ${inv.notiz ? `<div class="hist" style="margin-top:4px;color:var(--gold);">Notiz: ${escapeHtml(inv.notiz)}</div>` : ''}
+        <div style="color:var(--gold);">${renderNotizenListe(inv)}</div>
       </td>
     </tr>
   `;}).join('');
@@ -1366,10 +1399,9 @@ function openAkteDetail(az){
   document.getElementById('detailInvoices').querySelectorAll('[data-notiz]').forEach(el=>{
     el.addEventListener('click', ()=>{
       const id = el.getAttribute('data-notiz');
-      const cur = DATA.invoices.find(i=>i.rechnungsnummer===id);
-      const text = prompt('Notiz für Rechnung ' + id + ':', (cur && cur.notiz) || '');
+      const text = prompt('Neue Notiz für Rechnung ' + id + ' (wird dem Verlauf hinzugefügt):', '');
       if(text === null) return;
-      setInvoiceNotiz(id, text);
+      addInvoiceNotiz(id, text);
     });
   });
   const events = [];
@@ -1388,7 +1420,7 @@ function openAkteDetail(az){
       return `<div class="tl-item">
         <div class="tl-dot" style="background:${bg};color:${color};">${icon}</div>
         <div><div class="tl-label" style="color:${color};">${mahnLabel(ev.type)}${ev.type==='zahlung' && ev.betrag ? ` (${fmtEUR(ev.betrag)})` : ''}</div>
-        <div class="tl-meta">${fmtDate(ev.datum)} · Rechnung ${escapeHtml(ev.rechnungsnummer)}${ev.type==='manuell_erledigt' && ev.grund ? ` · Grund: ${escapeHtml(ev.grund)}` : ''}</div></div>
+        <div class="tl-meta">${fmtDate(ev.datum)} · Rechnung ${escapeHtml(ev.rechnungsnummer)}${ev.wer ? ` · ${escapeHtml(ev.wer)}` : ''}${ev.type==='manuell_erledigt' && ev.grund ? ` · Grund: ${escapeHtml(ev.grund)}` : ''}</div></div>
       </div>`;
     }).join('')}</div>`;
   }
@@ -1410,7 +1442,7 @@ function renderArchiv(){
   let docs = [];
   DATA.invoices.forEach(inv=>{
     (inv.mahnungen||[]).forEach(m=>{
-      docs.push({ datum: m.datum, type: m.type, betrag: m.betrag, aktenzeichen: inv.aktenzeichen, rechnungsnummer: inv.rechnungsnummer, mandant: inv.mandant||"", grund: m.grund||"" });
+      docs.push({ datum: m.datum, type: m.type, betrag: m.betrag, aktenzeichen: inv.aktenzeichen, rechnungsnummer: inv.rechnungsnummer, mandant: inv.mandant||"", grund: m.grund||"", wer: m.wer||"" });
     });
   });
   Object.entries(DATA.leereAktenVermerke || {}).forEach(([key, v])=>{
@@ -1435,7 +1467,7 @@ function renderArchiv(){
   }
   box.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;">
     <table><thead><tr>
-      <th>Datum</th><th>Aktenzeichen</th><th>Mandant</th><th>Dokument</th><th>Rechnung</th><th>Status</th>
+      <th>Datum</th><th>Aktenzeichen</th><th>Mandant</th><th>Dokument</th><th>Rechnung</th><th>Von</th><th>Status</th>
     </tr></thead>
     <tbody>${docs.map(d=>{
       const isZahlung = d.type === 'zahlung';
@@ -1453,6 +1485,7 @@ function renderArchiv(){
         <td>${escapeHtml(d.mandant||'–')}</td>
         <td style="color:${color};font-weight:600;">${docTypeLabel(d.type)}${isZahlung && d.betrag ? ` (${fmtEUR(d.betrag)})` : ''}${extra}</td>
         <td class="rn">${escapeHtml(d.rechnungsnummer)}</td>
+        <td>${escapeHtml(d.wer||'–')}</td>
         <td><span class="status-pill status-beglichen">${statusLabel}</span></td>
       </tr>`;
     }).join('')}</tbody></table>
@@ -1475,6 +1508,23 @@ function renderSettingsForm(){
   document.getElementById('setFrist').value = DATA.settings.frist || "10";
   document.getElementById('setZzTage').value = DATA.settings.zzTage || "14";
   renderTemplateFields();
+  renderActivityLog();
+}
+// Lädt und zeigt die letzten Einträge des allgemeinen Aktivitätsprotokolls (wer hat wann
+// Einstellungen/Vorlagen geändert oder Rechnungsdaten zurückgesetzt). Wird bei jedem Aufruf der
+// Einstellungen-Seite frisch aus der Datenbank geladen (nicht Teil von DATA/saveData).
+async function renderActivityLog(){
+  const box = document.getElementById('activityLogBox');
+  if(!box) return;
+  box.innerHTML = `<div class="modal-note">Lädt…</div>`;
+  const { data, error } = await supabaseClient.from('activity_log').select('*').order('datum', { ascending: false }).limit(20);
+  if(error || !data || data.length === 0){
+    box.innerHTML = `<div class="modal-note">Noch keine Einträge im Aktivitätsprotokoll.</div>`;
+    return;
+  }
+  box.innerHTML = data.map(e=>
+    `<div class="hist" style="margin-top:4px;"><strong>${escapeHtml(e.wer||'?')}</strong> · ${fmtDateTime(e.datum)} · ${escapeHtml(e.aktion)}${e.details ? ` – ${escapeHtml(e.details)}` : ''}</div>`
+  ).join('');
 }
 let activeTplTab = "erinnerung";
 function renderTemplateFields(){
@@ -1505,6 +1555,7 @@ document.getElementById('saveTplBtn').addEventListener('click', async ()=>{
     };
   });
   await saveData();
+  logActivity('Textvorlagen geändert');
   showToast("Vorlagen gespeichert.");
 });
 document.getElementById('saveSettingsBtn').addEventListener('click', async ()=>{
@@ -1517,6 +1568,7 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async ()=>{
   };
   DATA.invoices.forEach(inv=>{ if(inv.zahlungszielGeschaetzt) inv.zahlungsziel = null; computeDerived(inv); });
   await saveData();
+  logActivity('Einstellungen geändert');
   renderAll();
   showToast("Einstellungen gespeichert.");
 });
@@ -1547,7 +1599,7 @@ document.getElementById('sendReminderBtn').addEventListener('click', async ()=>{
   window.open(`mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`, '_blank');
   const { inv, type } = activeInvoiceForReminder;
   inv.mahnungen = inv.mahnungen || [];
-  inv.mahnungen.push({ type, datum: todayISO() });
+  inv.mahnungen.push({ type, datum: todayISO(), wer: currentKuerzel() });
   inv.email = email;
   await saveData();
   document.getElementById('reminderModal').classList.remove('show');
@@ -1587,6 +1639,16 @@ let selectedTeamMember = null;
 function initials(name){
   const parts = name.trim().split(/\s+/);
   return ((parts[0]?.[0]||"") + (parts[1]?.[0]||"")).toUpperCase() || "?";
+}
+// Kürzel der gerade angemeldeten Person (z.B. "AA", "IO") - wird an jeder protokollierten
+// Aktion mitgespeichert, damit nachvollziehbar bleibt, wer was gemacht hat.
+function currentKuerzel(){ return activeUserName ? initials(activeUserName) : "?"; }
+// Schreibt einen Eintrag in das allgemeine Aktivitätsprotokoll (nicht an eine einzelne
+// Rechnung gebunden, z.B. Einstellungen/Vorlagen geändert, Daten zurückgesetzt).
+async function logActivity(aktion, details){
+  try{
+    await supabaseClient.from('activity_log').insert({ wer: currentKuerzel(), aktion, details: details||null });
+  }catch(e){ console.warn("Aktivitätsprotokoll konnte nicht geschrieben werden:", e); }
 }
 function renderUserChip(){
   if(activeUserName){

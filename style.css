@@ -277,3 +277,30 @@
     .railbtn-danger{width:100%;box-sizing:border-box;border-top:1px solid var(--border);margin-top:6px;padding-top:14px;}
     .settings-grid{grid-template-columns:1fr;}
   }
+
+/* ===== Anmelde-Bildschirm (Namensauswahl + Passwort) ===== */
+.auth-gate{display:none;position:fixed;inset:0;z-index:500;align-items:center;justify-content:center;
+  padding:24px;background:radial-gradient(circle at 30% 20%,#1c2130 0%,#0c0e13 70%);}
+.auth-gate.show{display:flex;}
+.auth-card{width:100%;max-width:380px;background:var(--surface);border:1px solid var(--border);
+  border-radius:16px;padding:36px 32px 32px;box-shadow:0 24px 60px rgba(0,0,0,0.45);text-align:center;}
+.auth-eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--accent);font-weight:600;margin-bottom:10px;}
+.auth-title{font-family:'Newsreader',serif;font-size:22px;font-weight:600;margin:0 0 8px;color:var(--text);}
+.auth-note{font-size:12.5px;color:var(--text2);margin-bottom:24px;}
+.auth-userlist{display:flex;flex-direction:column;gap:10px;}
+.auth-user-btn{display:flex;align-items:center;gap:12px;width:100%;padding:12px 14px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:10px;cursor:pointer;
+  text-align:left;transition:border-color .15s,background .15s;}
+.auth-user-btn:hover{border-color:var(--accent);background:var(--accent-soft);}
+.auth-avatar{flex-shrink:0;width:36px;height:36px;border-radius:50%;background:var(--accent);
+  color:#fdf2f4;font-family:'IBM Plex Mono',monospace;font-weight:700;font-size:13px;
+  display:flex;align-items:center;justify-content:center;}
+.auth-user-name{font-size:14px;font-weight:600;color:var(--text);}
+.auth-passwordbox{text-align:left;margin-top:4px;}
+.auth-submit{width:100%;margin-top:4px;}
+.auth-back{display:block;width:100%;margin-top:14px;background:none;border:none;color:var(--text3);
+  font-size:12px;cursor:pointer;text-align:center;}
+.auth-back:hover{color:var(--text2);}
+.auth-error{font-size:12px;color:var(--red);background:var(--red-soft);border:1px solid var(--red);
+  border-radius:8px;padding:9px 12px;margin-bottom:14px;}

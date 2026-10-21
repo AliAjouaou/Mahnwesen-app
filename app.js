@@ -1479,18 +1479,36 @@ document.getElementById('sendReminderBtn').addEventListener('click', async ()=>{
   showToast(`${mahnLabel(type)} vermerkt und E-Mail-Programm geöffnet.`);
 });
 /* ============================================================
-   Login-Platzhalter (lokal, bis eine echte serverseitige Anmeldung eingebaut ist)
+   Anmeldung: Jede Person hat ihr eigenes Supabase-Auth-Konto (eigene
+   Login-E-Mail + eigenes Passwort, von dir in Supabase verwaltet).
+   Beim Start werden die Namen angezeigt; nach Auswahl wird das jeweils
+   eigene Passwort echt serverseitig über Supabase geprüft. Erst danach
+   startet die eigentliche App (loadData).
    ============================================================ */
-const LOGIN_KEY = "muster-dashboard-current-user";
+const SUPABASE_URL = "https://ckcvouwkgjoygrhxnukb.supabase.co";
+const SUPABASE_KEY = "sb_publishable_LmsPB5PuGX6p5eZMPNHEeA_OG-zEIMf";
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Feste Zuordnung Name -> Supabase-Login-E-Mail. Reihenfolge hier = Anzeigereihenfolge
+// im Anmelde-Fenster. Neue Kollegen/innen: hier einfach einen weiteren Eintrag ergänzen
+// und in Supabase (Authentication -> Users -> Add user) ein Konto mit derselben E-Mail anlegen.
+const TEAM = [
+  { name: "Isam Osman", email: "Isam@mahnwesen.de" },
+  { name: "Ali Ajouaou", email: "Ali@mahnwesen.de" }
+];
+
+const ACTIVE_USER_KEY = "muster-dashboard-active-user";
+let activeUserName = null;
+let selectedTeamMember = null;
+
 function initials(name){
   const parts = name.trim().split(/\s+/);
   return ((parts[0]?.[0]||"") + (parts[1]?.[0]||"")).toUpperCase() || "?";
 }
 function renderUserChip(){
-  const name = localStorage.getItem(LOGIN_KEY);
-  if(name){
-    document.getElementById('userAvatarInitial').textContent = initials(name);
-    document.getElementById('userChipName').textContent = name;
+  if(activeUserName){
+    document.getElementById('userAvatarInitial').textContent = initials(activeUserName);
+    document.getElementById('userChipName').textContent = activeUserName;
     document.querySelector('.user-chip-sub').textContent = "Angemeldet";
   } else {
     document.getElementById('userAvatarInitial').textContent = "?";
@@ -1498,25 +1516,89 @@ function renderUserChip(){
     document.querySelector('.user-chip-sub').textContent = "Anmelden";
   }
 }
-document.getElementById('userChip').addEventListener('click', ()=>{
-  document.getElementById('loginNameInput').value = localStorage.getItem(LOGIN_KEY) || "";
-  document.getElementById('loginModal').classList.add('show');
+document.getElementById('userChip').addEventListener('click', async ()=>{
+  if(!confirm(`Abmelden${activeUserName?' ('+activeUserName+')':''}?`)) return;
+  await supabaseClient.auth.signOut();
+  sessionStorage.removeItem(ACTIVE_USER_KEY);
+  location.reload();
 });
-document.getElementById('loginSaveBtn').addEventListener('click', ()=>{
-  const name = document.getElementById('loginNameInput').value.trim();
-  if(!name){ showToast("Bitte einen Namen eingeben."); return; }
-  localStorage.setItem(LOGIN_KEY, name);
+
+function showAuthError(msg){
+  const el = document.getElementById('authError');
+  el.textContent = msg; el.style.display = 'block';
+}
+function hideAuthError(){
+  document.getElementById('authError').style.display = 'none';
+}
+
+function renderUserList(){
+  const list = document.getElementById('authUserList');
+  list.innerHTML = TEAM.map(u => `
+    <button class="auth-user-btn" type="button" data-user="${escapeHtml(u.name)}">
+      <span class="auth-avatar">${escapeHtml(initials(u.name))}</span>
+      <span class="auth-user-name">${escapeHtml(u.name)}</span>
+    </button>`).join('');
+  list.querySelectorAll('[data-user]').forEach(b=>{
+    b.addEventListener('click', ()=> selectTeamMember(b.getAttribute('data-user')));
+  });
+}
+
+function selectTeamMember(name){
+  selectedTeamMember = TEAM.find(u => u.name === name);
+  if(!selectedTeamMember) return;
+  hideAuthError();
+  document.getElementById('authGateTitle').textContent = selectedTeamMember.name;
+  document.getElementById('authUserList').style.display = 'none';
+  document.getElementById('authPasswordBox').style.display = 'block';
+  document.getElementById('authPassword').value = '';
+  document.getElementById('authPassword').focus();
+}
+
+document.getElementById('authBackBtn').addEventListener('click', ()=>{
+  selectedTeamMember = null;
+  hideAuthError();
+  document.getElementById('authGateTitle').textContent = 'Wer arbeitet gerade?';
+  document.getElementById('authPasswordBox').style.display = 'none';
+  document.getElementById('authUserList').style.display = 'flex';
+});
+
+document.getElementById('authSubmitBtn').addEventListener('click', async ()=>{
+  if(!selectedTeamMember) return;
+  hideAuthError();
+  const password = document.getElementById('authPassword').value;
+  if(!password){ showAuthError('Bitte Passwort eingeben.'); return; }
+  const btn = document.getElementById('authSubmitBtn');
+  btn.disabled = true; btn.textContent = 'Prüfe…';
+  const { error } = await supabaseClient.auth.signInWithPassword({ email: selectedTeamMember.email, password });
+  btn.disabled = false; btn.textContent = 'Anmelden';
+  if(error){ showAuthError('Passwort falsch.'); return; }
+  activeUserName = selectedTeamMember.name;
+  sessionStorage.setItem(ACTIVE_USER_KEY, activeUserName);
+  document.getElementById('authGate').classList.remove('show');
   renderUserChip();
-  document.getElementById('loginModal').classList.remove('show');
-  showToast(`Angemeldet als ${name}.`);
+  startApp();
 });
-document.getElementById('logoutBtn').addEventListener('click', ()=>{
-  localStorage.removeItem(LOGIN_KEY);
-  renderUserChip();
-  document.getElementById('loginModal').classList.remove('show');
-  showToast("Abgemeldet.");
-});
-renderUserChip();
+document.getElementById('authPassword').addEventListener('keydown', e=>{ if(e.key==='Enter') document.getElementById('authSubmitBtn').click(); });
+
+async function startApp(){
+  await loadData();
+}
+
+// Beim (Neu-)Laden der Seite prüfen, ob bereits eine gültige Supabase-Sitzung besteht.
+(async function initAuthGate(){
+  renderUserList();
+  const { data: { session } } = await supabaseClient.auth.getSession();
+  if(session){
+    const saved = sessionStorage.getItem(ACTIVE_USER_KEY);
+    const match = TEAM.find(u => u.email.toLowerCase() === (session.user.email||'').toLowerCase());
+    activeUserName = saved || (match ? match.name : (session.user.email||'Angemeldet'));
+    document.getElementById('authGate').classList.remove('show');
+    renderUserChip();
+    startApp();
+    return;
+  }
+  // sonst: Namensauswahl bleibt sichtbar, das ist der Normalzustand beim ersten Aufruf.
+})();
 /* ============================================================
    Init
    ============================================================ */
@@ -1595,4 +1677,4 @@ function maybeShowDailyHint(){
 }
 // Prüft auch dann noch einmal, wenn die Seite über Nacht/über die 8-Uhr-Marke hinweg geöffnet bleibt.
 setInterval(maybeShowDailyHint, 5*60*1000);
-loadData();
+// loadData() wird jetzt erst nach erfolgreicher Anmeldung aufgerufen (siehe startApp() weiter oben).

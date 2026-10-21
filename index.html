@@ -22,6 +22,8 @@
      dem hinterlegten Fingerabdruck entspricht, und verweigert andernfalls die Ausfuehrung. Fingerabdruck
      stammt direkt von jsDelivrs eigener, offizieller Paket-Metadaten-API fuer xlsx@0.18.5/dist/xlsx.full.min.js. -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js" integrity="sha256-yVBhl8r4CaB1tt7h2g02+xnacVj/6KiOewyWxdhiPJk=" crossorigin="anonymous"></script>
+<!-- Supabase-Bibliothek: ermöglicht Login + gemeinsame Online-Datenbank statt localStorage -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -326,18 +328,26 @@
     </div>
   </div>
 </div>
-<!-- Login Modal (Platzhalter bis zu einer echten serverseitigen Anmeldung) -->
-<div class="modal-overlay" id="loginModal">
-  <div class="modal" style="max-width:380px;">
-    <div class="modal-head"><h3>Anmelden</h3><button class="close-x" data-close="loginModal">×</button></div>
-    <div class="modal-body">
-      <div class="modal-note">Vorläufige, lokale Kennung – nur zur Anzeige, wer gerade am Gerät arbeitet. Eine echte, passwortgeschützte Anmeldung folgt mit der gemeinsamen Online-Version.</div>
-      <div class="modal-field"><label>Ihr Name</label><input type="text" id="loginNameInput" placeholder="z.B. Max Mustermann"></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" id="logoutBtn" style="margin-right:auto;">Abmelden</button>
-      <button class="btn" data-close="loginModal">Abbrechen</button>
-      <button class="btn btn-primary" id="loginSaveBtn">Speichern</button>
+<!-- Anmelde-Bildschirm: Jede Person hat ihr eigenes Supabase-Konto (eigene Login-E-Mail +
+     eigenes Passwort, von dir in Supabase verwaltet). Beim Start werden die Namen angezeigt;
+     nach Auswahl wird das jeweils eigene Passwort echt serverseitig geprüft. Bleibt sichtbar,
+     bis eine gültige Anmeldung erfolgt ist - verdeckt die App komplett. -->
+<div class="auth-gate show" id="authGate">
+  <div class="auth-card">
+    <div class="auth-eyebrow">Mahnwesen-Dashboard</div>
+    <h3 class="auth-title" id="authGateTitle">Wer arbeitet gerade?</h3>
+    <div class="auth-note">Wähle deinen Namen und gib dein Passwort ein.</div>
+
+    <div id="authUserList" class="auth-userlist"></div>
+
+    <div id="authPasswordBox" class="auth-passwordbox" style="display:none;">
+      <div class="modal-field">
+        <label>Passwort</label>
+        <input type="password" id="authPassword" autocomplete="current-password">
+      </div>
+      <div class="auth-error" id="authError" style="display:none;"></div>
+      <button class="btn btn-primary auth-submit" id="authSubmitBtn">Anmelden</button>
+      <button class="auth-back" id="authBackBtn" type="button">← Andere Person wählen</button>
     </div>
   </div>
 </div>

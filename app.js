@@ -6,29 +6,112 @@ let sortMode = "az", sortDir = "asc";
 let activeInvoiceForReminder = null;
 let currentDetailAz = null;
 let detailReturnView = 'rechnungen';
-// Eigener Speicher-Schlüssel für die Muster-Vorlage, damit sie im selben Browser nicht die Daten
-// einer anderen (produktiven) Kopie des Dashboards liest oder überschreibt.
-const STORAGE_KEY = "muster-dashboard-data-v1";
 /* ============================================================
-   Storage
+   Storage: gemeinsame Online-Datenbank (Supabase) statt nur
+   lokalem Browser-Speicher. loadData() liest beim Start alles aus
+   der Datenbank; saveData() schreibt den kompletten aktuellen Stand
+   dorthin zurück (ersetzt jeweils den alten Inhalt der betroffenen
+   Tabellen), damit alle angemeldeten Personen denselben Stand sehen.
    ============================================================ */
 async function loadData(){
   try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if(raw){
-      const parsed = JSON.parse(raw);
-      DATA = Object.assign({invoices:[],settings:{},lastImport:null,importLog:[],templates:{},leereAktenVermerke:{}}, parsed);
-      DATA.settings = Object.assign({kanzlei:"",ansprech:"",iban:"",frist:"10",zzTage:"14"}, DATA.settings);
-      DATA.templates = DATA.templates || {};
-      DATA.leereAktenVermerke = DATA.leereAktenVermerke || {};
-    }
-  }catch(e){ console.warn("Konnte gespeicherte Daten nicht laden:", e); }
+    const [settingsRes, templatesRes, vermerkeRes, invoicesRes, mahnungenRes, importLogRes] = await Promise.all([
+      supabaseClient.from('settings').select('*').eq('id', 1).maybeSingle(),
+      supabaseClient.from('templates').select('*'),
+      supabaseClient.from('leere_akten_vermerke').select('*'),
+      supabaseClient.from('invoices').select('*'),
+      supabaseClient.from('mahnungen').select('*').order('datum'),
+      supabaseClient.from('import_log').select('*').order('timestamp', { ascending: false }).limit(30)
+    ]);
+
+    const s = settingsRes.data || {};
+    DATA.settings = {
+      kanzlei: s.kanzlei || "", ansprech: s.ansprech || "", iban: s.iban || "",
+      frist: s.frist || "10", zzTage: s.zz_tage || "14"
+    };
+
+    DATA.templates = {};
+    (templatesRes.data || []).forEach(t=>{ DATA.templates[t.type] = { subject: t.subject || "", text: t.text || "" }; });
+
+    DATA.leereAktenVermerke = {};
+    (vermerkeRes.data || []).forEach(v=>{
+      DATA.leereAktenVermerke[v.jahr + '-' + v.nummer] = { keineRechnung: v.keine_rechnung, grund: v.grund || "", datum: v.datum };
+    });
+
+    const mahnungenByRe = {};
+    (mahnungenRes.data || []).forEach(m=>{
+      (mahnungenByRe[m.rechnungsnummer] = mahnungenByRe[m.rechnungsnummer] || []).push({ type: m.type, datum: m.datum, betrag: m.betrag, grund: m.grund });
+    });
+
+    DATA.invoices = (invoicesRes.data || []).map(r=>{
+      const inv = {
+        rechnungsnummer: r.rechnungsnummer, aktenzeichen: r.aktenzeichen, mandant: r.mandant || "",
+        rechnungsdatum: r.rechnungsdatum, zahlungsziel: r.zahlungsziel, zahlungszielGeschaetzt: !!r.zahlungsziel_geschaetzt,
+        rechnungsbetrag: r.rechnungsbetrag, offenerBetrag: r.offener_betrag, beglichenerBetrag: r.beglichener_betrag,
+        guthaben: r.guthaben, statusdatum: r.statusdatum, email: r.email || "",
+        manuellErledigt: !!r.manuell_erledigt, manuellErledigtGrund: r.manuell_erledigt_grund,
+        manuellErledigtDatum: r.manuell_erledigt_datum, manuellErledigtBetrag: r.manuell_erledigt_betrag,
+        notiz: r.notiz, mahnungen: mahnungenByRe[r.rechnungsnummer] || []
+      };
+      computeDerived(inv);
+      return inv;
+    });
+
+    DATA.importLog = (importLogRes.data || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skippedDetails: l.skipped_details }));
+    DATA.lastImport = DATA.importLog[0] ? DATA.importLog[0].timestamp : null;
+  }catch(e){ console.warn("Konnte Daten aus der Datenbank nicht laden:", e); showToast("Daten konnten nicht geladen werden: " + e.message); }
   renderAll();
   maybeShowDailyHint();
 }
 async function saveData(){
   try{
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(DATA));
+    // Einstellungen (eine feste Zeile, id=1)
+    await supabaseClient.from('settings').update({
+      kanzlei: DATA.settings.kanzlei, ansprech: DATA.settings.ansprech, iban: DATA.settings.iban,
+      frist: DATA.settings.frist, zz_tage: DATA.settings.zzTage
+    }).eq('id', 1);
+
+    // Textvorlagen (komplett ersetzen)
+    await supabaseClient.from('templates').delete().neq('type', '__none__');
+    const templateRows = Object.entries(DATA.templates || {}).map(([type, t])=>({ type, subject: t.subject || "", text: t.text || "" }));
+    if(templateRows.length) await supabaseClient.from('templates').insert(templateRows);
+
+    // "Keine Rechnung erwartet"-Vermerke (komplett ersetzen)
+    await supabaseClient.from('leere_akten_vermerke').delete().neq('jahr', -1);
+    const vermerkeRows = Object.entries(DATA.leereAktenVermerke || {}).map(([key, v])=>{
+      const [jahr, nummer] = key.split('-').map(Number);
+      return { jahr, nummer, keine_rechnung: true, grund: v.grund || "", datum: v.datum || null };
+    });
+    if(vermerkeRows.length) await supabaseClient.from('leere_akten_vermerke').insert(vermerkeRows);
+
+    // Rechnungen + Mahnungen (komplett ersetzen - Mahnungen werden durch "on delete cascade"
+    // in der Datenbank automatisch mitgelöscht, wenn die zugehörige Rechnung gelöscht wird)
+    await supabaseClient.from('invoices').delete().neq('rechnungsnummer', '__none__');
+    const invoiceRows = DATA.invoices.map(i=>({
+      rechnungsnummer: i.rechnungsnummer, aktenzeichen: i.aktenzeichen, mandant: i.mandant || "",
+      rechnungsdatum: i.rechnungsdatum || null, zahlungsziel: i.zahlungsziel || null,
+      zahlungsziel_geschaetzt: !!i.zahlungszielGeschaetzt, rechnungsbetrag: i.rechnungsbetrag || 0,
+      offener_betrag: i.offenerBetrag || 0, beglichener_betrag: i.beglichenerBetrag || 0,
+      guthaben: i.guthaben || 0, statusdatum: i.statusdatum || null, email: i.email || "",
+      manuell_erledigt: !!i.manuellErledigt, manuell_erledigt_grund: i.manuellErledigtGrund || null,
+      manuell_erledigt_datum: i.manuellErledigtDatum || null, manuell_erledigt_betrag: i.manuellErledigtBetrag || null,
+      notiz: i.notiz || null
+    }));
+    if(invoiceRows.length) await supabaseClient.from('invoices').insert(invoiceRows);
+
+    const mahnungenRows = [];
+    DATA.invoices.forEach(i=>{
+      (i.mahnungen || []).forEach(m=>{
+        mahnungenRows.push({ rechnungsnummer: i.rechnungsnummer, type: m.type, datum: m.datum, betrag: m.betrag || null, grund: m.grund || null });
+      });
+    });
+    if(mahnungenRows.length) await supabaseClient.from('mahnungen').insert(mahnungenRows);
+
+    // Import-Verlauf (komplett ersetzen, max. 30 Einträge - siehe handleImportFile)
+    await supabaseClient.from('import_log').delete().neq('id', -1);
+    const importLogRows = (DATA.importLog || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skipped_details: l.skippedDetails || [] }));
+    if(importLogRows.length) await supabaseClient.from('import_log').insert(importLogRows);
+
     hideSaveFailBanner();
   }catch(e){
     showToast("Speichern fehlgeschlagen: " + e.message);

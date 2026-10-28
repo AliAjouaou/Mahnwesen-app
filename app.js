@@ -28,6 +28,46 @@ let pendingNotizenInserts = [];
 // Analog: welche Rechnungen (rechnungsnummer) seit dem letzten Speichern inhaltlich geändert wurden -
 // nur diese werden beim nächsten saveData() upgesertet, alle anderen Rechnungen bleiben unangetastet.
 let pendingInvoiceUpserts = new Set();
+// Schlüssel ("jahr-nummer"), deren letzter Speicherversuch bei saveVermerk()/saveBemerkung()
+// fehlgeschlagen ist - werden bei jedem weiteren saveData()-Aufruf automatisch erneut versucht,
+// damit eine fehlgeschlagene Änderung nicht einfach "verloren" liegen bleibt, bis die Person es
+// zufällig noch einmal manuell auslöst.
+let pendingVermerkKeys = new Set();
+let pendingBemerkungKeys = new Set();
+// Sammelt, welche Speicher-Vorgänge GERADE fehlgeschlagen sind (z.B. "settings", "invoices",
+// "vermerk:2026-12"). Der rote Dauer-Hinweis (saveFailBanner) wird nur versteckt, wenn diese Liste
+// leer ist - vorher konnte ein erfolgreicher Einzelvorgang (z.B. Einstellungen speichern) den Hinweis
+// verstecken, obwohl an anderer Stelle noch eine andere, nicht zusammenhängende Änderung nicht
+// gespeichert werden konnte.
+const failedSaveOps = new Set();
+function reportSaveFailure(opKey, message){
+  failedSaveOps.add(opKey);
+  if(message) showToast(message);
+  showSaveFailBanner();
+}
+function reportSaveSuccess(opKey){
+  failedSaveOps.delete(opKey);
+  if(failedSaveOps.size === 0) hideSaveFailBanner();
+}
+// Konflikt-Hinweis: eine oder mehrere Rechnungen konnten NICHT gespeichert werden, weil sie
+// zwischenzeitlich von der anderen Person geändert wurden (siehe saveData()/row_version). Bewusst ein
+// eigener, andersfarbiger Hinweis statt des roten Fehler-Banners, weil hier kein technischer Fehler
+// vorliegt, sondern ein ganz normaler Fall gleichzeitiger Arbeit, der aktiv gelöst werden muss (Seite
+// neu laden, bevor an genau dieser Rechnung weitergearbeitet wird).
+let conflictedRechnungsnummern = new Set();
+function showConflictBanner(){
+  const b = document.getElementById('conflictBanner');
+  if(!b) return;
+  const liste = Array.from(conflictedRechnungsnummern).join(', ');
+  const textEl = document.getElementById('conflictBannerText');
+  if(textEl) textEl.textContent = `Folgende Rechnung(en) wurden zwischenzeitlich von der anderen Person geändert und konnten deshalb nicht gespeichert werden: ${liste}. Bitte die Seite neu laden, bevor du an diesen Rechnungen weiterarbeitest.`;
+  b.style.display = 'flex';
+}
+function hideConflictBanner(){
+  const b = document.getElementById('conflictBanner');
+  if(b) b.style.display = 'none';
+  conflictedRechnungsnummern.clear();
+}
 /* ============================================================
    Storage: gemeinsame Online-Datenbank (Supabase) statt nur
    lokalem Browser-Speicher. loadData() liest beim Start alles aus
@@ -101,13 +141,18 @@ async function loadData(){
         guthaben: r.guthaben, statusdatum: r.statusdatum, email: r.email || "",
         manuellErledigt: !!r.manuell_erledigt, manuellErledigtGrund: r.manuell_erledigt_grund,
         manuellErledigtDatum: r.manuell_erledigt_datum, manuellErledigtBetrag: r.manuell_erledigt_betrag,
-        notiz: r.notiz, mahnungen: mahnungenByRe[r.rechnungsnummer] || [], notizen: notizenByRe[r.rechnungsnummer] || []
+        notiz: r.notiz, mahnungen: mahnungenByRe[r.rechnungsnummer] || [], notizen: notizenByRe[r.rechnungsnummer] || [],
+        // Wird bei jedem Speichern automatisch von der Datenbank hochgezählt (siehe Trigger in
+        // schema_changes.sql, TEIL 4) - dient der Konflikterkennung in saveData(): stimmt dieser Wert
+        // beim Speichern nicht mehr mit dem in der Datenbank überein, hat die andere Person diese
+        // Rechnung zwischenzeitlich geändert.
+        rowVersion: r.row_version || 1
       };
       computeDerived(inv);
       return inv;
     });
 
-    DATA.importLog = (importLogRes.data || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skippedDetails: l.skipped_details, wer: l.wer || "" }));
+    DATA.importLog = (importLogRes.data || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skippedDetails: l.skipped_details, wer: l.wer || "", vollstaendig: l.vollstaendig === undefined ? true : !!l.vollstaendig }));
     DATA.lastImport = DATA.importLog[0] ? DATA.importLog[0].timestamp : null;
 
     // Erst JETZT, nachdem alles fehlerfrei geladen und übernommen wurde, darf wieder gespeichert
@@ -118,14 +163,18 @@ async function loadData(){
     pendingMahnungenInserts = [];
     pendingNotizenInserts = [];
     pendingImportLogRow = null;
+    pendingVermerkKeys.clear();
+    pendingBemerkungKeys.clear();
+    // Ein frisches, erfolgreiches Laden ersetzt den kompletten lokalen Stand durch den aktuellen
+    // Datenbank-Stand - alle zuvor als "fehlgeschlagen" vermerkten Vorgänge und ein eventueller
+    // Konflikt-Hinweis sind damit gegenstandslos geworden.
+    failedSaveOps.clear();
     hideSaveFailBanner();
+    hideConflictBanner();
   }catch(e){
     console.warn("Konnte Daten aus der Datenbank nicht laden:", e);
     dataLoadedOk = false;
-    showToast("Daten konnten nicht geladen werden: " + e.message);
-    // Dauerhafter Hinweis (nicht nur der kurze Toast): ein Ladefehler ist kritisch, weil ohne
-    // vollständige Daten auch nicht sicher gespeichert werden darf (siehe saveData()).
-    showSaveFailBanner();
+    reportSaveFailure('load', "Daten konnten nicht geladen werden: " + e.message);
   }
   renderAll();
   maybeShowDailyHint();
@@ -146,31 +195,35 @@ let pendingImportLogRow = null;
 // dataLoadedOk weiter oben.
 function pruefeDatenGeladen(){
   if(dataLoadedOk) return true;
-  showToast("Speichern ist gerade deaktiviert, weil die Daten zuvor nicht korrekt geladen werden konnten. Bitte Seite neu laden.");
-  showSaveFailBanner();
+  reportSaveFailure('load', "Speichern ist gerade deaktiviert, weil die Daten zuvor nicht korrekt geladen werden konnten. Bitte Seite neu laden.");
   return false;
 }
 async function saveSettings(){
   if(!pruefeDatenGeladen()) return false;
-  const { error } = await supabaseClient.from('settings').update({
+  // .select() dazu: ein .update().eq('id',1) meldet KEINEN Fehler, wenn zufällig keine Zeile mit
+  // id=1 existiert (0 betroffene Zeilen gelten für Supabase/PostgREST nicht als Fehler) - ohne diese
+  // Prüfung würde die App "Erfolg" anzeigen, obwohl in Wahrheit nichts gespeichert wurde.
+  const { data, error } = await supabaseClient.from('settings').update({
     kanzlei: DATA.settings.kanzlei, ansprech: DATA.settings.ansprech, iban: DATA.settings.iban,
     frist: DATA.settings.frist, zz_tage: DATA.settings.zzTage
-  }).eq('id', 1);
-  if(error){ showToast("Einstellungen konnten nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
-  hideSaveFailBanner();
+  }).eq('id', 1).select();
+  if(error){ reportSaveFailure('settings', "Einstellungen konnten nicht gespeichert werden: " + error.message); return false; }
+  if(!data || !data.length){ reportSaveFailure('settings', 'Einstellungen konnten nicht gespeichert werden: Zeile nicht gefunden (id=1 existiert nicht in der Tabelle „settings").'); return false; }
+  reportSaveSuccess('settings');
   return true;
 }
 async function saveTemplates(){
   if(!pruefeDatenGeladen()) return false;
   const rows = Object.entries(DATA.templates || {}).map(([type, t])=>({ type, subject: t.subject || "", text: t.text || "" }));
-  if(!rows.length) return true;
+  if(!rows.length){ reportSaveSuccess('templates'); return true; }
   const { error } = await supabaseClient.from('templates').upsert(rows, { onConflict: 'type' });
-  if(error){ showToast("Vorlagen konnten nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
-  hideSaveFailBanner();
+  if(error){ reportSaveFailure('templates', "Vorlagen konnten nicht gespeichert werden: " + error.message); return false; }
+  reportSaveSuccess('templates');
   return true;
 }
 async function saveVermerk(year, num, vermerkOrNull){
-  if(!pruefeDatenGeladen()) return false;
+  const opKey = `vermerk:${year}-${num}`;
+  if(!pruefeDatenGeladen()){ pendingVermerkKeys.add(year+'-'+num); return false; }
   let error;
   if(vermerkOrNull){
     ({ error } = await supabaseClient.from('leere_akten_vermerke').upsert(
@@ -180,12 +233,20 @@ async function saveVermerk(year, num, vermerkOrNull){
   } else {
     ({ error } = await supabaseClient.from('leere_akten_vermerke').delete().eq('jahr', year).eq('nummer', num));
   }
-  if(error){ showToast("Vermerk konnte nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
-  hideSaveFailBanner();
+  if(error){
+    reportSaveFailure(opKey, "Vermerk konnte nicht gespeichert werden: " + error.message);
+    // Für einen späteren automatischen Wiederholungsversuch vormerken (siehe retryPendingSingleRowSaves(),
+    // wird bei jedem saveData()-Aufruf mit ausgeführt) - sonst müsste die Person es manuell erneut auslösen.
+    pendingVermerkKeys.add(year+'-'+num);
+    return false;
+  }
+  pendingVermerkKeys.delete(year+'-'+num);
+  reportSaveSuccess(opKey);
   return true;
 }
 async function saveBemerkung(year, num, bemerkungOrNull){
-  if(!pruefeDatenGeladen()) return false;
+  const opKey = `bemerkung:${year}-${num}`;
+  if(!pruefeDatenGeladen()){ pendingBemerkungKeys.add(year+'-'+num); return false; }
   let error;
   if(bemerkungOrNull){
     ({ error } = await supabaseClient.from('akten_bemerkungen').upsert(
@@ -195,33 +256,49 @@ async function saveBemerkung(year, num, bemerkungOrNull){
   } else {
     ({ error } = await supabaseClient.from('akten_bemerkungen').delete().eq('jahr', year).eq('nummer', num));
   }
-  if(error){ showToast("Bemerkung konnte nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
-  hideSaveFailBanner();
+  if(error){
+    reportSaveFailure(opKey, "Bemerkung konnte nicht gespeichert werden: " + error.message);
+    pendingBemerkungKeys.add(year+'-'+num);
+    return false;
+  }
+  pendingBemerkungKeys.delete(year+'-'+num);
+  reportSaveSuccess(opKey);
   return true;
 }
-// Vollständiges Zurücksetzen aller rechnungsbezogenen Daten - bewusst die EINZIGE Stelle im Programm,
-// die noch kompletttabellen leert. Das ist hier unproblematisch, weil es sich um eine einmalige,
-// im UI extra bestätigte ("Wirklich alle ... löschen?") Aktion handelt und nicht um laufendes
-// Speichern, das mit einer zweiten gleichzeitig arbeitenden Person kollidieren könnte.
+// Versucht fehlgeschlagene Vermerk-/Bemerkungs-Speicherungen erneut (siehe pendingVermerkKeys/
+// pendingBemerkungKeys oben). Wird am Anfang von saveData() mit aufgerufen, damit jede normale
+// Speicher-Aktion automatisch auch diese "liegen gebliebenen" Änderungen mit erledigt.
+async function retryPendingSingleRowSaves(){
+  for(const key of Array.from(pendingVermerkKeys)){
+    const dash = key.lastIndexOf('-');
+    const y = parseInt(key.slice(0,dash),10), n = parseInt(key.slice(dash+1),10);
+    const vermerk = (DATA.leereAktenVermerke || {})[key] || null;
+    await saveVermerk(y, n, vermerk);
+  }
+  for(const key of Array.from(pendingBemerkungKeys)){
+    const dash = key.lastIndexOf('-');
+    const y = parseInt(key.slice(0,dash),10), n = parseInt(key.slice(dash+1),10);
+    const bemerkung = (DATA.aktenBemerkungen || {})[key] || null;
+    await saveBemerkung(y, n, bemerkung);
+  }
+}
+// Vollständiges Zurücksetzen aller rechnungsbezogenen Daten - läuft serverseitig über eine einzige
+// Datenbankfunktion (reset_all_invoice_data(), siehe schema_changes.sql TEIL 4) in EINER Transaktion:
+// entweder werden wirklich ALLE betroffenen Tabellen geleert, oder (bei einem Fehler mittendrin) GAR
+// keine - vorher wurden die Tabellen nacheinander einzeln geleert, wobei bei einem Abbruch mittendrin
+// ein nur teilweise zurückgesetzter Datenbestand hätte zurückbleiben können.
 async function resetAllInvoiceData(){
   if(!pruefeDatenGeladen()) return false;
-  const ops = [
-    ['invoices', q=>q.neq('rechnungsnummer', '__none__')],
-    ['mahnungen', q=>q.neq('rechnungsnummer', '__none__')],
-    ['notizen', q=>q.neq('rechnungsnummer', '__none__')],
-    ['leere_akten_vermerke', q=>q.neq('jahr', -1)],
-    ['akten_bemerkungen', q=>q.neq('jahr', -1)],
-    ['import_log', q=>q.neq('id', -1)]
-  ];
-  for(const [table, applyFilter] of ops){
-    const { error } = await applyFilter(supabaseClient.from(table).delete());
-    if(error){ showToast(`Zurücksetzen fehlgeschlagen bei „${table}": ` + error.message); showSaveFailBanner(); return false; }
-  }
+  const { error } = await supabaseClient.rpc('reset_all_invoice_data');
+  if(error){ reportSaveFailure('reset', "Zurücksetzen fehlgeschlagen: " + error.message); return false; }
   pendingInvoiceUpserts.clear();
   pendingMahnungenInserts = [];
   pendingNotizenInserts = [];
   pendingImportLogRow = null;
-  hideSaveFailBanner();
+  pendingVermerkKeys.clear();
+  pendingBemerkungKeys.clear();
+  reportSaveSuccess('reset');
+  hideConflictBanner();
   return true;
 }
 /* ------------------------------------------------------------
@@ -236,8 +313,24 @@ async function resetAllInvoiceData(){
    so kann nie der Zustand entstehen, dass die Rechnung zwar aktualisiert, eine neue Mahnung/Notiz
    dazu aber (z.B. durch einen Verbindungsabbruch mittendrin) nicht mitgespeichert wurde.
    ------------------------------------------------------------ */
+// Rückgabewert von saveData(): IMMER ein Ergebnisobjekt, nie ein reiner true/false-Wert - nur so kann
+// z.B. der Excel-Import unterscheiden zwischen "alles gespeichert", "nur ein Teil gespeichert, Rest im
+// Konflikt" und "gar nichts gespeichert" (ein reines true/false hätte "teilweise gespeichert" bisher
+// fälschlich wie "alles okay" behandelt und "Import abgeschlossen" angezeigt, obwohl einzelne
+// Rechnungen wegen eines Konflikts gar nicht gespeichert wurden).
+//   ok: true, wenn WIRKLICH ALLES gespeichert wurde (keine Konflikte)
+//   partial: true, wenn ein Teil gespeichert wurde, aber mindestens eine Rechnung im Konflikt hängen blieb
+//   conflicts: alle Rechnungsnummern, die gerade im Konflikt stehen (nicht nur die aus diesem Aufruf)
+//   importConflicts: die Teilmenge von conflicts, die zu einem GERADE abgeschlossenen Excel-Import gehört
+function saveResult(ok, partial, conflicts, importConflicts){
+  return { ok, partial, conflicts: conflicts||[], importConflicts: importConflicts||[] };
+}
 async function saveData(){
-  if(!pruefeDatenGeladen()) return false;
+  if(!pruefeDatenGeladen()) return saveResult(false, false);
+  // Zuerst eventuell liegen gebliebene Vermerk-/Bemerkungs-Speicherungen nachholen (siehe
+  // retryPendingSingleRowSaves()) - unabhängig davon, ob für Rechnungen gerade überhaupt etwas zu tun ist.
+  await retryPendingSingleRowSaves();
+
   const mahnungenToSave = pendingMahnungenInserts.slice();
   const notizenToSave = pendingNotizenInserts.slice();
   const touchedIds = new Set([
@@ -245,7 +338,7 @@ async function saveData(){
     ...mahnungenToSave.map(m=>m.rechnungsnummer),
     ...notizenToSave.map(n=>n.rechnungsnummer)
   ]);
-  if(touchedIds.size === 0 && !pendingImportLogRow){ hideSaveFailBanner(); return true; }
+  if(touchedIds.size === 0 && !pendingImportLogRow){ reportSaveSuccess('invoices'); return saveResult(true, false); }
 
   const invoicesToSave = Array.from(touchedIds).map(rn => DATA.invoices.find(i=>i.rechnungsnummer===rn)).filter(Boolean);
   const payload = {
@@ -258,32 +351,68 @@ async function saveData(){
       manuell_erledigt: !!i.manuellErledigt, manuell_erledigt_grund: i.manuellErledigtGrund || null,
       manuell_erledigt_datum: i.manuellErledigtDatum || null, manuell_erledigt_betrag: i.manuellErledigtBetrag || null,
       notiz: i.notiz || null,
+      // Der zuletzt BEKANNTE Versionsstand dieser Rechnung (siehe loadData()/row_version) - die
+      // Datenbankfunktion vergleicht das mit dem TATSÄCHLICHEN aktuellen Stand und meldet einen
+      // Konflikt zurück, statt blind zu überschreiben, falls die andere Person diese Rechnung
+      // zwischenzeitlich geändert hat (siehe unten, "conflicts"-Auswertung).
+      expected_row_version: i.rowVersion || null,
       new_mahnungen: mahnungenToSave.filter(m=>m.rechnungsnummer===i.rechnungsnummer)
         .map(m=>({ type: m.type, datum: m.datum, betrag: (m.betrag===undefined?null:m.betrag), grund: m.grund||null, wer: m.wer||null })),
       new_notizen: notizenToSave.filter(n=>n.rechnungsnummer===i.rechnungsnummer)
         .map(n=>({ text: n.text, wer: n.wer||null, datum: n.datum }))
     }))
   };
+  // betroffeneRechnungsnummern VOR dem Leeren von pendingImportLogRow merken - sonst wüssten wir am
+  // Ende nicht mehr, welche Konflikte (falls welche auftreten) zu GENAU DIESEM Import gehörten, im
+  // Unterschied zu Konflikten aus einer ganz anderen, unabhängigen Aktion.
+  const importBetroffeneIds = pendingImportLogRow ? (pendingImportLogRow.betroffeneRechnungsnummern || []) : [];
   if(pendingImportLogRow){
     payload.import_log = {
       filename: pendingImportLogRow.filename, timestamp: pendingImportLogRow.timestamp,
       imported: pendingImportLogRow.imported, skipped: pendingImportLogRow.skipped,
-      skipped_details: pendingImportLogRow.skippedDetails || [], wer: pendingImportLogRow.wer || null
+      skipped_details: pendingImportLogRow.skippedDetails || [], wer: pendingImportLogRow.wer || null,
+      betroffene_rechnungsnummern: importBetroffeneIds
     };
   }
 
-  const { error } = await supabaseClient.rpc('upsert_invoices_and_history', { payload });
+  const { data, error } = await supabaseClient.rpc('upsert_invoices_and_history', { payload });
   if(error){
-    showToast("Speichern fehlgeschlagen: " + error.message);
-    showSaveFailBanner();
-    return false;
+    reportSaveFailure('invoices', "Speichern fehlgeschlagen: " + error.message);
+    return saveResult(false, false);
   }
-  pendingInvoiceUpserts.clear();
-  pendingMahnungenInserts = [];
-  pendingNotizenInserts = [];
+  const conflicts = new Set((data && data.conflicts) || []);
+  if(conflicts.size){
+    // Für jede konfliktbehaftete Rechnung: lokale Änderung NICHT verwerfen (bleibt in den Pending-Listen
+    // stehen, damit nichts verloren geht), aber auch NICHT als erfolgreich gespeichert markieren. Alle
+    // anderen, nicht betroffenen Rechnungen werden ganz normal als gespeichert übernommen.
+    conflictedRechnungsnummern = new Set([...conflictedRechnungsnummern, ...conflicts]);
+    pendingInvoiceUpserts = new Set(Array.from(pendingInvoiceUpserts).filter(id=>conflicts.has(id)));
+    pendingMahnungenInserts = pendingMahnungenInserts.filter(m=>conflicts.has(m.rechnungsnummer));
+    pendingNotizenInserts = pendingNotizenInserts.filter(n=>conflicts.has(n.rechnungsnummer));
+    showConflictBanner();
+  } else {
+    pendingInvoiceUpserts.clear();
+    pendingMahnungenInserts = [];
+    pendingNotizenInserts = [];
+  }
+  // Das Import-Protokoll wird von der Datenbankfunktion IMMER geschrieben (siehe schema_changes.sql
+  // TEIL 5, Punkt 2 der zweiten Code-Überarbeitung), aber die Funktion korrigiert dabei selbst die
+  // imported/skipped-Zahlen und setzt "vollstaendig" auf false, falls unter den zu diesem Import
+  // gehörenden Rechnungen welche durch einen Konflikt NICHT gespeichert werden konnten - so zeigt die
+  // Historie immer die tatsächlich gespeicherten Zahlen, nie einen fälschlich "vollständigen" Import.
+  // Für alle ERFOLGREICH (also nicht konfliktbehaftet) gespeicherten Rechnungen den lokal bekannten
+  // Versionsstand um 1 erhöhen - die Datenbank macht das serverseitig automatisch per Trigger bei jedem
+  // echten Update (bzw. setzt ihn bei einer neuen Rechnung auf 1), das hier bildet das nur lokal nach,
+  // damit der nächste Speicherversuch mit dem richtigen erwarteten Stand vergleicht, ohne extra
+  // nachzuladen.
+  invoicesToSave.forEach(i=>{ if(!conflicts.has(i.rechnungsnummer)) i.rowVersion = (i.rowVersion||0) + 1; });
   pendingImportLogRow = null;
-  hideSaveFailBanner();
-  return true;
+  reportSaveSuccess('invoices');
+  // importConflicts: nur die Konflikte, die zu DIESEM Import gehörten (für die Import-Rückmeldung in
+  // handleImportFile) - "conflicts" selbst enthält ALLE gerade offenen Konflikte, auch ältere, die mit
+  // diesem Import nichts zu tun haben.
+  const importConflicts = importBetroffeneIds.filter(id => conflicts.has(id));
+  return saveResult(conflicts.size === 0, conflicts.size > 0, Array.from(conflicts), importConflicts);
 }
 // Dauerhafter Hinweis (verschwindet NICHT von selbst wie der Toast), solange eine Änderung nicht
 // gespeichert werden konnte - damit das nicht unbemerkt bleibt und Daten verloren gehen.
@@ -313,27 +442,79 @@ function parseNumberDE(v){
   const hasComma = s.includes(',');
   const hasDot = s.includes('.');
   if(hasComma && hasDot){
-    // z.B. "1.234,56" -> Punkt ist Tausendertrenner, Komma ist Dezimaltrenner
+    // z.B. "1.234,56" -> Punkt ist Tausendertrenner, Komma ist Dezimaltrenner. WICHTIG: Punkte NICHT
+    // blind entfernen - das würde ein falsch gruppiertes "1.2.3,45" fälschlich als 123,45 durchgehen
+    // lassen. Stattdessen streng prüfen, dass es sich um korrekte 3er-Tausendergruppen handelt (z.B.
+    // "1.234.567,89" ist gültig, "1.2.3,45" ist es nicht).
+    if(!/^-?\d{1,3}(\.\d{3})*,\d+$/.test(s)) return null;
     s = s.replace(/\./g,'').replace(',', '.');
   } else if(hasComma){
-    // z.B. "1234,56" -> Komma ist Dezimaltrenner
+    // z.B. "1234,56" -> Komma ist Dezimaltrenner (kein Tausendertrennzeichen vorhanden, daher keine
+    // Gruppen-Prüfung nötig - nur dass vor/nach dem Komma ausschließlich Ziffern stehen).
+    if(!/^-?\d+,\d+$/.test(s)) return null;
     s = s.replace(',', '.');
+  } else if(hasDot){
+    // Nur Punkt(e) vorhanden, kein Komma: entweder ein einzelner Dezimalpunkt (z.B. "1234.56", "1234.5")
+    // oder englisches Tausenderformat ganz ohne Dezimalstelle (z.B. "1.234" = eintausend234). Auch hier
+    // streng auf korrekte 3er-Gruppen prüfen, falls mehrere Punkte vorkommen - sonst würde z.B.
+    // "1.2.3" (eindeutig fehlerhaft) unbemerkt als 1.2 oder Ähnliches interpretiert.
+    const dotCount = (s.match(/\./g)||[]).length;
+    if(dotCount > 1){
+      if(!/^-?\d{1,3}(\.\d{3})+$/.test(s)) return null;
+      s = s.replace(/\./g,'');
+    } else if(!/^-?\d+(\.\d+)?$/.test(s)) return null;
+  } else {
+    // Gar kein Trennzeichen - muss eine reine Ganzzahl sein.
+    if(!/^-?\d+$/.test(s)) return null;
   }
-  // nur Punkt vorhanden (z.B. "1234.56") oder gar kein Trennzeichen: bereits im richtigen Format
+  // Nach der Bereinigung MUSS der GESAMTE verbleibende Text eine gültige Zahl sein - parseFloat() allein
+  // würde z.B. "12abc" fälschlich als 12 akzeptieren, weil es nur den gültigen Anfang eines Strings
+  // liest und den Rest stillschweigend ignoriert. Dieser abschließende Regex-Vollabgleich fängt das ab,
+  // falls oben versehentlich etwas durchrutschen sollte (doppelte Absicherung).
+  if(!/^-?\d+(\.\d+)?$/.test(s)) return null;
   const n = parseFloat(s);
   return isNaN(n) ? null : n;
 }
 function toISO(d){
   if(!d) return null;
-  if(d instanceof Date) return d.toISOString().slice(0,10);
+  // WICHTIG: NICHT d.toISOString() verwenden (wie früher) - das rechnet immer auf UTC um. Die
+  // Excel-Bibliothek (SheetJS, cellDates:true) liefert ein Date-Objekt, dessen Datum als "lokale
+  // Mitternacht dieses Kalendertags" zu verstehen ist. Deutschland liegt bei UTC+1/+2 - lokale
+  // Mitternacht ist in UTC also bereits 22:00/23:00 Uhr des VORTAGS. toISOString() würde das Datum
+  // dadurch für JEDEN reinen Datumswert (ohne Uhrzeit) um einen Tag zurückverschieben. Die lokalen
+  // Datumskomponenten (getFullYear/getMonth/getDate) sind unabhängig von der Zeitzonen-Umrechnung und
+  // liefern deshalb immer den tatsächlich gemeinten Kalendertag.
+  if(d instanceof Date){
+    const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
+    return `${y}-${m}-${day}`;
+  }
   if(typeof d === "number"){ const epoch = new Date(Date.UTC(1899,11,30)); return new Date(epoch.getTime()+d*86400000).toISOString().slice(0,10); }
   const s = String(d).trim();
+  // Prüft, ob Jahr/Monat/Tag tatsächlich ein existierendes Kalenderdatum ergeben (z.B. "32.13.2026" oder
+  // "30.02.2026" syntaktisch durch das Regex gekommen, aber kein echtes Datum). JS würde ein ungültiges
+  // Datum sonst stillschweigend in den nächsten Monat "überlaufen" lassen (z.B. 30.02. -> 02.03.) - durch
+  // den Rückvergleich mit den konstruierten Date-Komponenten wird das erkannt und abgelehnt.
+  function istEchtesKalenderdatum(y, mo, da){
+    const dt = new Date(Date.UTC(y, mo-1, da));
+    return dt.getUTCFullYear()===y && dt.getUTCMonth()===mo-1 && dt.getUTCDate()===da;
+  }
   let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if(m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
-  m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if(m) return s.slice(0,10);
-  const dt = new Date(s);
-  if(!isNaN(dt)) return dt.toISOString().slice(0,10);
+  if(m){
+    const day=+m[1], mon=+m[2], year=+m[3];
+    if(!istEchtesKalenderdatum(year, mon, day)) return null;
+    return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  }
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if(m){
+    const year=+m[1], mon=+m[2], day=+m[3];
+    if(!istEchtesKalenderdatum(year, mon, day)) return null;
+    return s;
+  }
+  // WICHTIG: Kein allgemeiner new Date(s)-Fallback mehr (wie in einer früheren Version) - das ist
+  // mehrdeutig (je nach Format/Systemumgebung unterschiedlich interpretiert) und kann unbemerkt ein
+  // falsches Datum liefern. Ein nicht in den beiden obigen, eindeutigen Formaten erkennbarer Wert gilt
+  // jetzt bewusst als ungültig und wird beim Import als "nicht erkennbares Datumsformat" gemeldet,
+  // statt geraten zu werden.
   return null;
 }
 function fmtDate(iso){ if(!iso) return "–"; const [y,m,d]=iso.split("-"); return `${d}.${m}.${y}`; }
@@ -660,6 +841,12 @@ function escapeHtml(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;
 // einzelne Stelle einen eigenen keydown-Listener bräuchte.
 document.addEventListener('keydown', (e)=>{
   if(e.key !== 'Enter' && e.key !== ' ') return;
+  // Steht der Tastatur-Fokus auf einem ECHTEN interaktiven Element (z.B. ein <button> innerhalb einer
+  // Tabellenzeile, die selbst role="button" trägt - siehe z.B. renderMahnwesen()), kümmert sich der
+  // Browser von sich aus um Enter/Leertaste für dieses Element. In dem Fall NICHT zusätzlich noch den
+  // umschließenden role="button" auslösen, sonst würden zwei Aktionen gleichzeitig passieren (z.B.
+  // "Erinnerung senden" UND parallel die Akte öffnen).
+  if(e.target.closest('button, a[href], input, textarea, select')) return;
   const el = e.target.closest('[role="button"]');
   if(!el) return;
   e.preventDefault();
@@ -803,6 +990,11 @@ async function handleImportFile(file){
 
       const rec = {
         rechnungsnummer: String(rechnungsnummer),
+        // WICHTIG fuer die Konflikterkennung beim Speichern (siehe saveData()/row_version): bei einer
+        // bereits vorhandenen Rechnung MUSS die zuletzt bekannte Versionsnummer hier uebernommen werden.
+        // Fehlt sie, haelt die Datenbank-Funktion die Rechnung faelschlich fuer "neu" und ueberschreibt
+        // sie beim Speichern ungeprueft, ohne einen Konflikt zu melden - das war ein bestaetigter Bug.
+        rowVersion: existing?.rowVersion ?? null,
         aktenzeichen: String(aktenzeichen).trim(),
         mandant: get("Mandant","Empfänger","Empfaenger") || (existing?existing.mandant:"") || "",
         rechnungsdatum,
@@ -840,17 +1032,25 @@ async function handleImportFile(file){
     });
     DATA.invoices = Object.values(byId);
     DATA.lastImport = new Date().toISOString();
-    const importLogEintrag = { filename: file.name, timestamp: DATA.lastImport, imported, skipped, skippedDetails, wer: currentKuerzel() };
+    // betroffeneRechnungsnummern: welche Rechnungen zu DIESEM Import gehören - die Speicherfunktion
+    // prüft damit, ob beim Speichern unter diesen Rechnungen ein Konflikt mit einer zwischenzeitlichen
+    // Änderung der anderen Person aufgetreten ist, und markiert den Protokoll-Eintrag in dem Fall
+    // korrekt als "unvollständig" statt fälschlich "vollständig" zu melden (siehe saveData()/Punkt 2
+    // der zweiten Code-Überarbeitung).
+    const importLogEintrag = { filename: file.name, timestamp: DATA.lastImport, imported, skipped, skippedDetails, wer: currentKuerzel(), betroffeneRechnungsnummern: touchedIds.slice() };
     DATA.importLog.unshift(importLogEintrag);
     DATA.importLog = DATA.importLog.slice(0, 30);
     touchedIds.forEach(id => pendingInvoiceUpserts.add(id));
     pendingImportLogRow = importLogEintrag;
-    const ok = await saveData();
+    const result = await saveData();
     renderAll();
-    if(ok){
+    if(result.ok){
       showToast(`Import abgeschlossen: ${imported} Rechnung(en) übernommen${skipped?`, ${skipped} Zeile(n) übersprungen`:''}.`);
+    } else if(result.partial){
+      const gespeichert = imported - result.importConflicts.length;
+      showToast(`Import teilweise gespeichert: ${gespeichert} Rechnung(en) gespeichert, ${result.importConflicts.length} Konflikt(e). Bitte Konflikthinweis beachten.`);
     } else {
-      showToast(`Import verarbeitet, aber NICHT gespeichert (siehe Hinweisbanner oben) - bitte erneut versuchen.`);
+      showToast('Import konnte nicht gespeichert werden. Bitte den Fehlerhinweis prüfen und erneut versuchen.');
     }
   }catch(err){
     showToast("Fehler beim Import: " + err.message);
@@ -858,6 +1058,163 @@ async function handleImportFile(file){
 }
 document.getElementById('fileInput').addEventListener('change', (e)=>{ if(e.target.files[0]) handleImportFile(e.target.files[0]); e.target.value=""; });
 document.getElementById('saveFailExportBtn').addEventListener('click', ()=>{ document.getElementById('exportBtn').click(); });
+/* ------------------------------------------------------------
+   Konfliktauflösung: statt die ganze Seite blind neu zu laden (und damit alle noch nicht
+   gespeicherten lokalen Änderungen wegzuwerfen), wird für jede konfliktbehaftete Rechnung gezielt der
+   aktuelle Datenbankstand nachgeladen und der Person zur Entscheidung vorgelegt: eigene Änderung
+   verwerfen (DB-Stand übernehmen) oder eigene Änderung trotzdem speichern (dafür wird zuvor die
+   erwartete rowVersion aktualisiert, damit der nächste Speicherversuch nicht erneut als Konflikt
+   abgelehnt wird). Kein vollständiger Zusammenführungs-Editor - das ist laut Vorgabe nicht nötig,
+   solange die Entscheidung klar und bewusst getroffen wird und nichts automatisch verworfen wird.
+   ------------------------------------------------------------ */
+// Lädt NUR den aktuellen Datenbankstand EINER Rechnung (plus ihrer Mahnungen/Notizen) frisch nach -
+// unabhängig vom restlichen lokalen DATA-Stand. Gibt null zurück, wenn die Rechnung in der Datenbank
+// nicht (mehr) existiert.
+async function fetchInvoiceFreshState(rechnungsnummer){
+  const [invRes, mahnRes, notizRes] = await Promise.all([
+    supabaseClient.from('invoices').select('*').eq('rechnungsnummer', rechnungsnummer).maybeSingle(),
+    supabaseClient.from('mahnungen').select('*').eq('rechnungsnummer', rechnungsnummer).order('datum'),
+    supabaseClient.from('notizen').select('*').eq('rechnungsnummer', rechnungsnummer).order('datum')
+  ]);
+  if(invRes.error || mahnRes.error || notizRes.error){
+    throw new Error((invRes.error || mahnRes.error || notizRes.error).message);
+  }
+  const r = invRes.data;
+  if(!r) return null; // Rechnung wurde zwischenzeitlich gelöscht (z.B. durch "Rechnungsdaten zurücksetzen")
+  const inv = {
+    rechnungsnummer: r.rechnungsnummer, aktenzeichen: r.aktenzeichen, mandant: r.mandant || "",
+    rechnungsdatum: r.rechnungsdatum, zahlungsziel: r.zahlungsziel, zahlungszielGeschaetzt: !!r.zahlungsziel_geschaetzt,
+    rechnungsbetrag: r.rechnungsbetrag, offenerBetrag: r.offener_betrag, beglichenerBetrag: r.beglichener_betrag,
+    guthaben: r.guthaben, statusdatum: r.statusdatum, email: r.email || "",
+    manuellErledigt: !!r.manuell_erledigt, manuellErledigtGrund: r.manuell_erledigt_grund,
+    manuellErledigtDatum: r.manuell_erledigt_datum, manuellErledigtBetrag: r.manuell_erledigt_betrag,
+    notiz: r.notiz,
+    mahnungen: (mahnRes.data||[]).map(m=>({ type: m.type, datum: m.datum, betrag: m.betrag, grund: m.grund, wer: m.wer || "" })),
+    notizen: (notizRes.data||[]).map(n=>({ text: n.text, wer: n.wer || "", datum: n.datum })),
+    rowVersion: r.row_version || 1
+  };
+  computeDerived(inv);
+  return inv;
+}
+// Baut den Inhalt des Konflikt-Modals: pro konfliktbehafteter Rechnung eine Gegenüberstellung aus
+// aktuellem Datenbankstand und der eigenen, noch nicht gespeicherten lokalen Fassung, mit zwei
+// klaren Entscheidungs-Buttons.
+async function renderConflictModal(){
+  const body = document.getElementById('conflictModalBody');
+  if(!body) return;
+  const nummern = Array.from(conflictedRechnungsnummern);
+  if(nummern.length === 0){
+    document.getElementById('conflictModal').classList.remove('show');
+    hideConflictBanner();
+    return;
+  }
+  body.innerHTML = '<p>Lade aktuellen Datenbankstand…</p>';
+  let frischeStaende;
+  try{
+    frischeStaende = await Promise.all(nummern.map(async rn => ({ rn, frisch: await fetchInvoiceFreshState(rn) })));
+  }catch(e){
+    body.innerHTML = `<p>Datenbankstand konnte nicht geladen werden: ${escapeHtml(e.message)}. Bitte später erneut versuchen.</p>`;
+    return;
+  }
+  body.innerHTML = frischeStaende.map(({rn, frisch})=>{
+    const lokal = DATA.invoices.find(i=>i.rechnungsnummer===rn);
+    if(!frisch){
+      return `<div class="modal-field" style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;">
+        <strong>Rechnung ${escapeHtml(rn)}</strong>
+        <p>Diese Rechnung wurde in der Datenbank nicht mehr gefunden (z.B. durch ein Zurücksetzen der Rechnungsdaten).</p>
+        <button class="btn btn-sm" data-conflict-discard="${escapeHtml(rn)}">Eigene Änderung verwerfen</button>
+      </div>`;
+    }
+    const lokalLabel = lokal ? `offener Betrag ${lokal.offenerBetrag} €, Status ${escapeHtml(lokal.status)}, ${lokal.mahnungen.length} Mahnung(en)/Vermerk(e), ${lokal.notizen.length} Notiz(en)` : '(keine lokale Fassung mehr vorhanden)';
+    const frischLabel = `offener Betrag ${frisch.offenerBetrag} €, Status ${escapeHtml(frisch.status)}, ${frisch.mahnungen.length} Mahnung(en)/Vermerk(e), ${frisch.notizen.length} Notiz(en)`;
+    return `<div class="modal-field" style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px;">
+      <strong>Rechnung ${escapeHtml(rn)}</strong> ${lokal ? `(Akte ${escapeHtml(lokal.aktenzeichen||'')})` : ''}
+      <p style="margin:6px 0;"><strong>Aktueller Datenbankstand (von der anderen Person):</strong><br>${frischLabel}</p>
+      <p style="margin:6px 0;"><strong>Deine eigene, noch nicht gespeicherte Änderung:</strong><br>${lokalLabel}</p>
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <button class="btn btn-sm" data-conflict-discard="${escapeHtml(rn)}">Meine Änderung verwerfen</button>
+        <button class="btn btn-sm btn-primary" data-conflict-override="${escapeHtml(rn)}">Trotzdem mit meiner Änderung überschreiben</button>
+      </div>
+    </div>`;
+  }).join('');
+  body.querySelectorAll('[data-conflict-discard]').forEach(btn=>{
+    btn.addEventListener('click', ()=> resolveConflictDiscard(btn.getAttribute('data-conflict-discard')));
+  });
+  body.querySelectorAll('[data-conflict-override]').forEach(btn=>{
+    btn.addEventListener('click', ()=> resolveConflictOverride(btn.getAttribute('data-conflict-override')));
+  });
+}
+// Entscheidung "verwerfen": die eigene lokale Änderung an dieser EINEN Rechnung wird fallengelassen,
+// der frisch geladene Datenbankstand übernommen. Ausstehende Mahnungen/Notizen zu dieser Rechnung
+// gehen damit bewusst verloren - die Person hat das gerade ausdrücklich so entschieden.
+async function resolveConflictDiscard(rechnungsnummer){
+  try{
+    const frisch = await fetchInvoiceFreshState(rechnungsnummer);
+    const idx = DATA.invoices.findIndex(i=>i.rechnungsnummer===rechnungsnummer);
+    if(frisch){
+      if(idx>=0) DATA.invoices[idx] = frisch; else DATA.invoices.push(frisch);
+    } else if(idx>=0){
+      DATA.invoices.splice(idx,1); // Rechnung existiert in der DB nicht mehr
+    }
+    pendingInvoiceUpserts.delete(rechnungsnummer);
+    pendingMahnungenInserts = pendingMahnungenInserts.filter(m=>m.rechnungsnummer!==rechnungsnummer);
+    pendingNotizenInserts = pendingNotizenInserts.filter(n=>n.rechnungsnummer!==rechnungsnummer);
+    conflictedRechnungsnummern.delete(rechnungsnummer);
+    showToast(`Rechnung ${rechnungsnummer}: Datenbankstand übernommen, eigene Änderung verworfen.`);
+    if(conflictedRechnungsnummern.size===0){ document.getElementById('conflictModal').classList.remove('show'); hideConflictBanner(); }
+    else { showConflictBanner(); await renderConflictModal(); }
+    renderAll();
+  }catch(e){
+    showToast("Konnte Datenbankstand nicht nachladen: " + e.message);
+  }
+}
+// Entscheidung "trotzdem überschreiben": die lokale Änderung bleibt wie sie ist, nur die erwartete
+// rowVersion wird auf den frisch geladenen Stand aktualisiert, damit der anschließende saveData()-Aufruf
+// nicht erneut als Konflikt abgelehnt wird. Erst NACH dieser ausdrücklichen Entscheidung wird gespeichert -
+// nie automatisch mit dem alten Versionsstand.
+async function resolveConflictOverride(rechnungsnummer){
+  try{
+    const frisch = await fetchInvoiceFreshState(rechnungsnummer);
+    if(!frisch){
+      showToast(`Rechnung ${rechnungsnummer} existiert in der Datenbank nicht mehr - eigene Änderung kann nicht überschrieben werden. Bitte "Verwerfen" wählen.`);
+      return;
+    }
+    const lokal = DATA.invoices.find(i=>i.rechnungsnummer===rechnungsnummer);
+    if(lokal) lokal.rowVersion = frisch.rowVersion;
+    conflictedRechnungsnummern.delete(rechnungsnummer);
+    pendingInvoiceUpserts.add(rechnungsnummer);
+    const result = await saveData();
+    // WICHTIG: eine leere Konfliktliste bedeutet NICHT automatisch Erfolg - bei einem technischen
+    // Speicherfehler (z.B. RPC-Aufruf schlägt fehl, keine Internetverbindung) ist result.conflicts
+    // ebenfalls leer, obwohl gar nichts gespeichert wurde. Deshalb zusätzlich result.ok/result.partial
+    // prüfen, bevor fälschlich eine Erfolgsmeldung erscheint.
+    if(result.conflicts.includes(rechnungsnummer)){
+      showToast(`Rechnung ${rechnungsnummer}: wurde erneut gleichzeitig geändert. Bitte noch einmal entscheiden.`);
+    } else if(result.ok || result.partial){
+      // Bei einem Teilerfolg muss diese Rechnungsnummer selbst nicht in result.conflicts enthalten sein.
+      showToast(`Rechnung ${rechnungsnummer}: eigene Änderung gespeichert.`);
+    } else {
+      showToast(`Rechnung ${rechnungsnummer}: Änderung konnte nicht gespeichert werden. Bitte den Fehlerhinweis prüfen.`);
+    }
+    if(conflictedRechnungsnummern.size===0){ document.getElementById('conflictModal').classList.remove('show'); hideConflictBanner(); }
+    else { showConflictBanner(); await renderConflictModal(); }
+    renderAll();
+  }catch(e){
+    showToast("Konnte eigene Änderung nicht speichern: " + e.message);
+  }
+}
+document.getElementById('conflictViewBtn').addEventListener('click', ()=>{
+  document.getElementById('conflictModal').classList.add('show');
+  renderConflictModal();
+});
+// Fallback-Weg, falls die Person den einzelnen Konflikten nicht Rechnung für Rechnung nachgehen will:
+// kein stillschweigendes location.reload() mehr, sondern erst eine klare Warnung mit den betroffenen
+// Rechnungsnummern, die ausdrücklich bestätigt werden muss - erst danach wird neu geladen.
+document.getElementById('conflictReloadBtn').addEventListener('click', ()=>{
+  const nummern = Array.from(conflictedRechnungsnummern).join(', ');
+  const warnung = `Achtung: Beim Neuladen gehen deine eigenen, noch nicht gespeicherten Änderungen an folgender/n Rechnung(en) verloren: ${nummern}.\n\nMöchtest du wirklich ohne Auflösung neu laden?`;
+  if(confirm(warnung)) location.reload();
+});
 document.getElementById('resetBtn').addEventListener('click', async ()=>{
   if(!confirm('Wirklich alle importierten Rechnungsdaten löschen (inkl. „Keine Rechnung erwartet"-Vermerken und Akten-Bemerkungen)? Dies kann nicht rückgängig gemacht werden.')) return;
   // Alles, was sich auf konkrete Rechnungen/Aktenzeichen bezieht, wird zurückgesetzt - nicht nur die
@@ -1642,11 +1999,18 @@ function renderReports(){
       const details = log.skippedDetails || [];
       const shown = details.slice(0,10);
       const detailHtml = shown.length ? `<tr><td colspan="4" style="padding-top:0;">
-        <div class="hist due" style="margin-top:0;">Übersprungene Zeilen: ${shown.map(d=>`Zeile ${d.zeile} (${escapeHtml(d.grund)})`).join(' · ')}${details.length>shown.length?` · … und ${details.length-shown.length} weitere`:''}</div>
+        <div class="hist due" style="margin-top:0;">Übersprungene Zeilen: ${shown.map(d=>d.zeile!=null?`Zeile ${d.zeile} (${escapeHtml(d.grund)})`:escapeHtml(d.grund)).join(' · ')}${details.length>shown.length?` · … und ${details.length-shown.length} weitere`:''}</div>
       </td></tr>` : '';
+      // "vollstaendig === false": einzelne Rechnungen dieses Imports konnten wegen eines gleichzeitigen
+      // Konflikts (die andere Person hat exakt diese Rechnung zeitgleich geändert) nicht gespeichert
+      // werden - die angezeigten Zahlen sind trotzdem korrekt (siehe saveData()/TEIL 5), nur eben nicht
+      // "vollständig" in diesem einen Speicherdurchlauf. Diese fehlenden Rechnungen werden automatisch
+      // beim nächsten erfolgreichen Speichern nachgeholt, sobald die Seite neu geladen wurde.
+      const unvollstaendigHinweis = log.vollstaendig===false
+        ? `<span class="hist due" style="margin-left:8px;">⚠ unvollständig – einzelne Rechnungen folgen nach einem erneuten Speichern</span>` : '';
       return `
       <tr>
-        <td>📄 ${escapeHtml(log.filename)}</td>
+        <td>📄 ${escapeHtml(log.filename)}${unvollstaendigHinweis}</td>
         <td>${fmtDateTime(log.timestamp)}</td>
         <td class="amount" style="color:var(--green)">${log.imported}</td>
         <td class="amount" style="color:${log.skipped?'var(--red)':'var(--text2)'}">${log.skipped}</td>

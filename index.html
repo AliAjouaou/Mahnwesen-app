@@ -32,6 +32,14 @@
     <span>⚠️ Die letzte Änderung konnte nicht gespeichert werden – bitte jetzt sichern, damit nichts verloren geht.</span>
     <button class="btn btn-sm" id="saveFailExportBtn" style="background:#fff;color:var(--red);border-color:#fff;flex-shrink:0;">⇩ Jetzt als Excel exportieren</button>
   </div>
+  <!-- Erscheint NICHT bei einem technischen Fehler, sondern wenn die andere Person zeitgleich dieselbe
+       Rechnung geändert hat (siehe saveData()/row_version in app.js) - bewusst andersfarbig als der rote
+       Fehler-Hinweis, weil hier kein Fehler, sondern ganz normale gleichzeitige Arbeit vorliegt. -->
+  <div id="conflictBanner" style="display:none;background:var(--yellow);color:#1a1200;padding:11px 24px;font-size:13px;font-weight:600;align-items:center;gap:16px;flex-shrink:0;">
+    <span id="conflictBannerText">⚠️ Eine Rechnung wurde zwischenzeitlich von der anderen Person geändert.</span>
+    <button class="btn btn-sm" id="conflictViewBtn" style="background:#1a1200;color:#fff;border-color:#1a1200;flex-shrink:0;">Konflikte ansehen &amp; auflösen</button>
+    <button class="btn btn-sm" id="conflictReloadBtn" style="background:transparent;color:#1a1200;border-color:#1a1200;flex-shrink:0;">↻ Stattdessen alles neu laden</button>
+  </div>
   <div class="bodyrow">
     <div class="sidebar">
       <div class="sidebar-brand">
@@ -330,6 +338,18 @@
     <div class="modal-foot">
       <button class="btn" data-close="reminderModal">Abbrechen</button>
       <button class="btn btn-primary" id="sendReminderBtn">In E-Mail-Programm öffnen &amp; als versendet vermerken</button>
+    </div>
+  </div>
+</div>
+<!-- Konflikt-Modal: zeigt jede im Konflikt stehende Rechnung einzeln, gegenübergestellt mit dem
+     aktuellen Datenbank-Stand, und lässt bewusst entscheiden statt automatisch/stillschweigend etwas
+     zu verwerfen oder zu überschreiben (siehe app.js, openConflictResolution()). -->
+<div class="modal-overlay" id="conflictModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Konflikte auflösen</h3><button class="close-x" data-close="conflictModal">×</button></div>
+    <div class="modal-body">
+      <div class="modal-note">Diese Rechnung(en) wurden zwischenzeitlich von der anderen Person geändert. Wähle pro Rechnung, ob deine eigene, noch nicht gespeicherte Änderung verworfen oder trotzdem übernommen werden soll.</div>
+      <div id="conflictModalBody"></div>
     </div>
   </div>
 </div>

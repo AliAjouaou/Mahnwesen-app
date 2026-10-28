@@ -1,7 +1,7 @@
 /* ============================================================
    State
    ============================================================ */
-let DATA = { invoices: [], settings: { kanzlei:"", ansprech:"", iban:"", frist:"10", zzTage:"14" }, lastImport: null, importLog: [], templates: {}, leereAktenVermerke: {} };
+let DATA = { invoices: [], settings: { kanzlei:"", ansprech:"", iban:"", frist:"10", zzTage:"14" }, lastImport: null, importLog: [], templates: {}, leereAktenVermerke: {}, aktenBemerkungen: {} };
 let sortMode = "az", sortDir = "asc";
 let activeInvoiceForReminder = null;
 let currentDetailAz = null;
@@ -15,10 +15,11 @@ let detailReturnView = 'rechnungen';
    ============================================================ */
 async function loadData(){
   try{
-    const [settingsRes, templatesRes, vermerkeRes, invoicesRes, mahnungenRes, notizenRes, importLogRes] = await Promise.all([
+    const [settingsRes, templatesRes, vermerkeRes, bemerkungenRes, invoicesRes, mahnungenRes, notizenRes, importLogRes] = await Promise.all([
       supabaseClient.from('settings').select('*').eq('id', 1).maybeSingle(),
       supabaseClient.from('templates').select('*'),
       supabaseClient.from('leere_akten_vermerke').select('*'),
+      supabaseClient.from('akten_bemerkungen').select('*'),
       supabaseClient.from('invoices').select('*'),
       supabaseClient.from('mahnungen').select('*').order('datum'),
       supabaseClient.from('notizen').select('*').order('datum'),
@@ -37,6 +38,11 @@ async function loadData(){
     DATA.leereAktenVermerke = {};
     (vermerkeRes.data || []).forEach(v=>{
       DATA.leereAktenVermerke[v.jahr + '-' + v.nummer] = { keineRechnung: v.keine_rechnung, grund: v.grund || "", datum: v.datum, wer: v.wer || "" };
+    });
+
+    DATA.aktenBemerkungen = {};
+    (bemerkungenRes.data || []).forEach(b=>{
+      DATA.aktenBemerkungen[b.jahr + '-' + b.nummer] = { text: b.text, wer: b.wer || "", datum: b.datum };
     });
 
     const mahnungenByRe = {};
@@ -89,6 +95,14 @@ async function saveData(){
       return { jahr, nummer, keine_rechnung: true, grund: v.grund || "", datum: v.datum || null, wer: v.wer || null };
     });
     if(vermerkeRows.length) await supabaseClient.from('leere_akten_vermerke').insert(vermerkeRows);
+
+    // Bemerkungen zu Aktenzeichen (komplett ersetzen)
+    await supabaseClient.from('akten_bemerkungen').delete().neq('jahr', -1);
+    const bemerkungenRows = Object.entries(DATA.aktenBemerkungen || {}).map(([key, b])=>{
+      const [jahr, nummer] = key.split('-').map(Number);
+      return { jahr, nummer, text: b.text, wer: b.wer || null, datum: b.datum || null };
+    });
+    if(bemerkungenRows.length) await supabaseClient.from('akten_bemerkungen').insert(bemerkungenRows);
 
     // Rechnungen + Mahnungen (komplett ersetzen - Mahnungen werden durch "on delete cascade"
     // in der Datenbank automatisch mitgelöscht, wenn die zugehörige Rechnung gelöscht wird)
@@ -296,6 +310,24 @@ function clearKeineRechnungVermerk(year, num){
   saveData();
   renderAll();
 }
+// Frei editierbare Bemerkung zu einem Aktenzeichen (unabhängig davon, ob dazu schon Rechnungen
+// vorliegen) - z.B. "mit Mandant X vereinbart: 500€ Pauschale". Anders als der Notizen-Verlauf bei
+// einzelnen Rechnungen gibt es hier bewusst nur EINE aktuelle Bemerkung, die dauerhaft ersetzt oder
+// gelöscht werden kann (kein Verlauf), weil es hier um einen aktuellen Arbeits-Vermerk geht.
+function setAktenBemerkung(year, num, text){
+  const key = year+'-'+num;
+  const trimmed = (text||'').trim();
+  DATA.aktenBemerkungen = DATA.aktenBemerkungen || {};
+  if(!trimmed){ delete DATA.aktenBemerkungen[key]; }
+  else { DATA.aktenBemerkungen[key] = { text: trimmed, wer: currentKuerzel(), datum: new Date().toISOString() }; }
+  saveData();
+  renderAll();
+}
+function deleteAktenBemerkung(year, num){
+  if(DATA.aktenBemerkungen) delete DATA.aktenBemerkungen[year+'-'+num];
+  saveData();
+  renderAll();
+}
 function mahnLabel(type){ return type==='mahnung2' ? '2. Mahnung' : type==='mahnung' ? '1. Mahnung' : type==='zahlung' ? 'Zahlung erhalten' : type==='manuell_erledigt' ? 'Manuell erledigt' : type==='keine_rechnung' ? 'Keine Rechnung erwartet' : 'Erinnerung'; }
 // Button-Beschriftung/Tooltip und Verlaufs-Liste für die Notizen einer Rechnung.
 function notizButtonLabel(inv){ const n=(inv.notizen||[]).length; return n ? `📝 Notizen (${n})` : '📝 Notiz'; }
@@ -310,6 +342,21 @@ function renderNotizenListe(inv){
     `<div class="hist" style="margin-top:3px;">📝 <strong>${escapeHtml(n.wer||'?')}</strong>, ${fmtDateTime(n.datum)}: ${escapeHtml(n.text)}</div>`
   ).join('');
   return items;
+}
+// Baustein "Bemerkung zur Akte" (eine aktuelle, frei editier-/löschbare Notiz je Aktenzeichen,
+// unabhängig von Rechnungen) - wird sowohl bei Aktenzeichen-Lücken als auch bei Akten mit
+// vorhandenen Rechnungen im Mandanten-Bereich angezeigt.
+function renderBemerkungBlock(key, bemerkung){
+  return `
+    <div class="akte-row akte-row-nested" style="display:block;color:var(--text2);padding:16px;border-top:1px solid var(--border);">
+      <label style="display:block;font-size:11.5px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">📌 Bemerkung zur Akte</label>
+      <textarea data-bemerkung-text="${key}" placeholder="z.B. mit Mandant vereinbart: 500€ Pauschale ..." style="min-height:48px;">${bemerkung ? escapeHtml(bemerkung.text) : ''}</textarea>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;">
+        <button class="btn btn-sm" data-bemerkung-save="${key}">Speichern</button>
+        ${bemerkung ? `<button class="btn btn-sm btn-danger" data-bemerkung-delete="${key}">Dauerhaft löschen</button>` : ''}
+      </div>
+      ${bemerkung ? `<div class="hist" style="margin-top:6px;">${escapeHtml(bemerkung.wer||'?')}, ${fmtDateTime(bemerkung.datum)}</div>` : ''}
+    </div>`;
 }
 function getMahnStatus(inv){
   if(inv.status === 'beglichen') return null;
@@ -556,13 +603,13 @@ async function handleImportFile(file){
 document.getElementById('fileInput').addEventListener('change', (e)=>{ if(e.target.files[0]) handleImportFile(e.target.files[0]); e.target.value=""; });
 document.getElementById('saveFailExportBtn').addEventListener('click', ()=>{ document.getElementById('exportBtn').click(); });
 document.getElementById('resetBtn').addEventListener('click', async ()=>{
-  if(!confirm('Wirklich alle importierten Rechnungsdaten löschen (inkl. „Keine Rechnung erwartet"-Vermerken und deren Notizen)? Dies kann nicht rückgängig gemacht werden.')) return;
+  if(!confirm('Wirklich alle importierten Rechnungsdaten löschen (inkl. „Keine Rechnung erwartet"-Vermerken und Akten-Bemerkungen)? Dies kann nicht rückgängig gemacht werden.')) return;
   // Alles, was sich auf konkrete Rechnungen/Aktenzeichen bezieht, wird zurückgesetzt - nicht nur die
   // Rechnungen selbst (mit ihren Notizen/Verlauf), sondern auch die "Keine Rechnung erwartet"-Vermerke
-  // zu Aktenzeichen-Lücken, da diese sonst im Archiv/Verlauf sichtbar stehen bleiben würden, obwohl
-  // keine Rechnungsdaten mehr vorhanden sind. Einstellungen, Textvorlagen und der Login-Name bleiben
-  // davon bewusst unberührt (siehe Button-Name "Rechnungsdaten zurücksetzen").
-  DATA.invoices = []; DATA.lastImport = null; DATA.importLog = []; DATA.leereAktenVermerke = {};
+  // und Akten-Bemerkungen zu Aktenzeichen, da diese sonst im Archiv/Verlauf sichtbar stehen bleiben
+  // würden, obwohl keine Rechnungsdaten mehr vorhanden sind. Einstellungen, Textvorlagen und der
+  // Login-Name bleiben davon bewusst unberührt (siehe Button-Name "Rechnungsdaten zurücksetzen").
+  DATA.invoices = []; DATA.lastImport = null; DATA.importLog = []; DATA.leereAktenVermerke = {}; DATA.aktenBemerkungen = {};
   await saveData(); logActivity('Rechnungsdaten zurückgesetzt'); showView('dashboard'); renderAll();
 });
 document.getElementById('exportBtn').addEventListener('click', ()=>{
@@ -1107,12 +1154,13 @@ function renderMandanten(){
       const vermerk = (DATA.leereAktenVermerke || {})[vermerkKey];
       const isNoRe = vermerk && vermerk.keineRechnung;
       const azTagStyleGap = isNoRe ? ' style="color:var(--green);border-color:var(--green);"' : '';
+      const bemerkung = (DATA.aktenBemerkungen || {})[vermerkKey];
       rowsHtml += `
       <div class="mandant-card">
         <div class="mandant-row" data-toggle="${panelId}">
           <span class="az-tag"${azTagStyleGap}>${n}/${yearShort}</span>
           <span class="mandant-name"></span>
-          <span class="akte-meta" style="font-style:italic;">${isNoRe ? 'Keine Rechnung erwartet' + (vermerk.grund ? ` – ${escapeHtml(vermerk.grund)}` : '') + (vermerk.wer ? ` (${escapeHtml(vermerk.wer)}, ${fmtDate(vermerk.datum)})` : '') : '– kein Vorgang hinterlegt –'}</span>
+          <span class="akte-meta" style="font-style:italic;">${isNoRe ? 'Keine Rechnung erwartet' + (vermerk.grund ? ` – ${escapeHtml(vermerk.grund)}` : '') + (vermerk.wer ? ` (${escapeHtml(vermerk.wer)}, ${fmtDate(vermerk.datum)})` : '') : '– kein Vorgang hinterlegt –'}${bemerkung ? ' · 📌 Bemerkung' : ''}</span>
           <div class="sums"></div>
           <span class="mandant-caret" id="caret-${panelId}">▾</span>
         </div>
@@ -1125,6 +1173,7 @@ function renderMandanten(){
             <textarea data-nore-grund="${vermerkKey}" placeholder="Grund / Notiz (optional)" style="min-height:56px;margin-top:8px;">${isNoRe ? escapeHtml(vermerk.grund||'') : ''}</textarea>
             <button class="btn btn-sm" data-nore-save="${vermerkKey}" style="margin-top:8px;">Speichern</button>
           </div>
+          ${renderBemerkungBlock(vermerkKey, bemerkung)}
         </div>
       </div>`;
       continue;
@@ -1141,7 +1190,7 @@ function renderMandanten(){
       <div class="mandant-row" data-toggle="${panelId}">
         <span class="az-tag"${azTagStyle}>${n}/${yearShort}</span>
         <span class="mandant-name">${escapeHtml(name)}</span>
-        <span class="akte-meta">${g.invoices.length} Rechnung${g.invoices.length>1?'en':''}</span>
+        <span class="akte-meta">${g.invoices.length} Rechnung${g.invoices.length>1?'en':''}${(DATA.aktenBemerkungen||{})[selectedAzYear + '-' + n] ? ' · 📌 Bemerkung' : ''}</span>
         <div class="sums">
           <div><div class="sum-label">Gesamt</div><div class="sum-value">${fmtEUR(sumTotal)}</div></div>
           <div><div class="sum-label">Offen</div><div class="sum-value ${isSettled?'green':'red'}">${fmtEUR(sumOffen)}</div></div>
@@ -1158,6 +1207,7 @@ function renderMandanten(){
           </div>
           <span style="color:var(--text3);">→</span>
         </div>
+        ${renderBemerkungBlock(selectedAzYear + '-' + n, (DATA.aktenBemerkungen || {})[selectedAzYear + '-' + n])}
       </div>
     </div>`;
   }
@@ -1189,6 +1239,27 @@ function renderMandanten(){
       const grund = panel.querySelector('[data-nore-grund]').value;
       if(checked) setKeineRechnungVermerk(y, n, grund);
       else clearKeineRechnungVermerk(y, n);
+    });
+  });
+  box.querySelectorAll('[data-bemerkung-save]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const key = el.getAttribute('data-bemerkung-save');
+      const dash = key.lastIndexOf('-');
+      const y = parseInt(key.slice(0,dash),10), n = parseInt(key.slice(dash+1),10);
+      const panel = el.closest('.akte-row-nested');
+      const text = panel.querySelector('[data-bemerkung-text]').value;
+      setAktenBemerkung(y, n, text);
+    });
+  });
+  box.querySelectorAll('[data-bemerkung-delete]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      if(!confirm('Diese Bemerkung wirklich dauerhaft löschen?')) return;
+      const key = el.getAttribute('data-bemerkung-delete');
+      const dash = key.lastIndexOf('-');
+      const y = parseInt(key.slice(0,dash),10), n = parseInt(key.slice(dash+1),10);
+      deleteAktenBemerkung(y, n);
     });
   });
 }

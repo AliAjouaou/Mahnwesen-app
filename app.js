@@ -6,6 +6,28 @@ let sortMode = "az", sortDir = "asc";
 let activeInvoiceForReminder = null;
 let currentDetailAz = null;
 let detailReturnView = 'rechnungen';
+// Schwelle, ab der ein offener Betrag als "praktisch beglichen" gilt (Rundungsdifferenzen,
+// Bankgebühren o.ä.). Fachliche Entscheidung - siehe Hinweis am Ende der Datei ("Offene fachliche
+// Entscheidungen"). An einer zentralen Stelle gekapselt, damit sie nicht an mehreren Orten im Code
+// unterschiedlich gehandhabt werden kann.
+const BEGLICHEN_SCHWELLE_EUR = 5;
+// Wird erst auf true gesetzt, nachdem loadData() die Daten EINMAL vollständig und ohne Fehler aus der
+// Datenbank gelesen hat. Solange das nicht der Fall ist, blockiert saveData() jeden Speicherversuch -
+// so kann ein fehlgeschlagenes Laden (z.B. Netzwerkfehler) nicht dazu führen, dass ein unvollständiger
+// oder leerer lokaler Datenbestand anschließend in die Datenbank zurückgeschrieben wird und echte
+// Daten überschreibt.
+let dataLoadedOk = false;
+// Gezielte Speicherung statt "alles löschen und neu schreiben": statt bei jedem Speichern ALLE
+// Mahnungen/Notizen aller Rechnungen zu löschen und neu einzufügen (siehe frühere Version), werden
+// neu entstandene Einträge hier zwischengespeichert und beim nächsten saveData()-Aufruf NUR diese neuen
+// Zeilen eingefügt - bereits gespeicherte Einträge anderer Rechnungen (die z.B. die Kollegin/der Kollege
+// gerade parallel bearbeitet) werden nie angefasst. Mahnungen/Notizen werden im Programm nie bearbeitet
+// oder gelöscht, nur neu hinzugefügt - deshalb reicht ein reines "nur einfügen" hier aus.
+let pendingMahnungenInserts = [];
+let pendingNotizenInserts = [];
+// Analog: welche Rechnungen (rechnungsnummer) seit dem letzten Speichern inhaltlich geändert wurden -
+// nur diese werden beim nächsten saveData() upgesertet, alle anderen Rechnungen bleiben unangetastet.
+let pendingInvoiceUpserts = new Set();
 /* ============================================================
    Storage: gemeinsame Online-Datenbank (Supabase) statt nur
    lokalem Browser-Speicher. loadData() liest beim Start alles aus
@@ -25,6 +47,22 @@ async function loadData(){
       supabaseClient.from('notizen').select('*').order('datum'),
       supabaseClient.from('import_log').select('*').order('timestamp', { ascending: false }).limit(30)
     ]);
+
+    // Jedes einzelne Ergebnis auf einen Fehler prüfen, BEVOR irgendetwas davon in DATA übernommen wird.
+    // Supabase-Aufrufe werfen bei einem fehlgeschlagenen Lesevorgang in aller Regel KEINE Exception -
+    // das Ergebnis kommt ganz normal mit einem gesetzten "error"-Feld zurück. Ein try/catch allein (wie
+    // zuvor) würde das NICHT bemerken, und DATA würde anschließend mit teilweise leeren/unvollständigen
+    // Werten überschrieben. Genau das verhindert diese Prüfung: bei einem Fehler wird direkt eine
+    // Exception ausgelöst, bevor eine einzige DATA.*-Zuweisung passiert ist.
+    const loadResults = {
+      Einstellungen: settingsRes, Textvorlagen: templatesRes, 'Keine-Rechnung-Vermerke': vermerkeRes,
+      'Akten-Bemerkungen': bemerkungenRes, Rechnungen: invoicesRes, Mahnungen: mahnungenRes,
+      Notizen: notizenRes, 'Import-Verlauf': importLogRes
+    };
+    const fehlerhaft = Object.entries(loadResults).filter(([, r]) => r.error);
+    if(fehlerhaft.length){
+      throw new Error(fehlerhaft.map(([label, r]) => `${label}: ${r.error.message}`).join(' | '));
+    }
 
     const s = settingsRes.data || {};
     DATA.settings = {
@@ -71,43 +109,147 @@ async function loadData(){
 
     DATA.importLog = (importLogRes.data || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skippedDetails: l.skipped_details, wer: l.wer || "" }));
     DATA.lastImport = DATA.importLog[0] ? DATA.importLog[0].timestamp : null;
-  }catch(e){ console.warn("Konnte Daten aus der Datenbank nicht laden:", e); showToast("Daten konnten nicht geladen werden: " + e.message); }
+
+    // Erst JETZT, nachdem alles fehlerfrei geladen und übernommen wurde, darf wieder gespeichert
+    // werden. Außerdem sind nach einem frischen Laden keine "ausstehenden" lokalen Änderungen mehr
+    // offen - alles, was in der Datenbank steht, ist jetzt auch in DATA.
+    dataLoadedOk = true;
+    pendingInvoiceUpserts.clear();
+    pendingMahnungenInserts = [];
+    pendingNotizenInserts = [];
+    pendingImportLogRow = null;
+    hideSaveFailBanner();
+  }catch(e){
+    console.warn("Konnte Daten aus der Datenbank nicht laden:", e);
+    dataLoadedOk = false;
+    showToast("Daten konnten nicht geladen werden: " + e.message);
+    // Dauerhafter Hinweis (nicht nur der kurze Toast): ein Ladefehler ist kritisch, weil ohne
+    // vollständige Daten auch nicht sicher gespeichert werden darf (siehe saveData()).
+    showSaveFailBanner();
+  }
   renderAll();
   maybeShowDailyHint();
 }
+// Ein neu entstandener Import-Log-Eintrag, der beim nächsten saveData() mitgespeichert wird (siehe
+// handleImportFile). Analog zu den pendingMahnungenInserts/pendingNotizenInserts-Listen oben.
+let pendingImportLogRow = null;
+/* ------------------------------------------------------------
+   Einzelne, in sich abgeschlossene Tabellen (Einstellungen, Textvorlagen, "Keine Rechnung
+   erwartet"-Vermerke, Akten-Bemerkungen): hier ist ein Full-Resync nicht nötig, weil jede dieser
+   Tabellen entweder nur eine Zeile hat (Einstellungen) oder über einen stabilen, kleinen Schlüssel
+   gezielt angesprochen werden kann (type bzw. jahr+nummer). Ein einfaches "update"/"upsert"/"delete"
+   auf genau die betroffene(n) Zeile(n) reicht hier aus und birgt kein Risiko, dass die Änderung
+   einer anderen Person überschrieben wird.
+   ------------------------------------------------------------ */
+// Kleiner gemeinsamer Schutz für ALLE Speicherfunktionen (nicht nur saveData()): solange die Daten
+// noch nie erfolgreich geladen wurden, wird nichts geschrieben - siehe ausführliche Begründung bei
+// dataLoadedOk weiter oben.
+function pruefeDatenGeladen(){
+  if(dataLoadedOk) return true;
+  showToast("Speichern ist gerade deaktiviert, weil die Daten zuvor nicht korrekt geladen werden konnten. Bitte Seite neu laden.");
+  showSaveFailBanner();
+  return false;
+}
+async function saveSettings(){
+  if(!pruefeDatenGeladen()) return false;
+  const { error } = await supabaseClient.from('settings').update({
+    kanzlei: DATA.settings.kanzlei, ansprech: DATA.settings.ansprech, iban: DATA.settings.iban,
+    frist: DATA.settings.frist, zz_tage: DATA.settings.zzTage
+  }).eq('id', 1);
+  if(error){ showToast("Einstellungen konnten nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
+  hideSaveFailBanner();
+  return true;
+}
+async function saveTemplates(){
+  if(!pruefeDatenGeladen()) return false;
+  const rows = Object.entries(DATA.templates || {}).map(([type, t])=>({ type, subject: t.subject || "", text: t.text || "" }));
+  if(!rows.length) return true;
+  const { error } = await supabaseClient.from('templates').upsert(rows, { onConflict: 'type' });
+  if(error){ showToast("Vorlagen konnten nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
+  hideSaveFailBanner();
+  return true;
+}
+async function saveVermerk(year, num, vermerkOrNull){
+  if(!pruefeDatenGeladen()) return false;
+  let error;
+  if(vermerkOrNull){
+    ({ error } = await supabaseClient.from('leere_akten_vermerke').upsert(
+      { jahr: year, nummer: num, keine_rechnung: true, grund: vermerkOrNull.grund || "", datum: vermerkOrNull.datum || null, wer: vermerkOrNull.wer || null },
+      { onConflict: 'jahr,nummer' }
+    ));
+  } else {
+    ({ error } = await supabaseClient.from('leere_akten_vermerke').delete().eq('jahr', year).eq('nummer', num));
+  }
+  if(error){ showToast("Vermerk konnte nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
+  hideSaveFailBanner();
+  return true;
+}
+async function saveBemerkung(year, num, bemerkungOrNull){
+  if(!pruefeDatenGeladen()) return false;
+  let error;
+  if(bemerkungOrNull){
+    ({ error } = await supabaseClient.from('akten_bemerkungen').upsert(
+      { jahr: year, nummer: num, text: bemerkungOrNull.text, wer: bemerkungOrNull.wer || null, datum: bemerkungOrNull.datum || null },
+      { onConflict: 'jahr,nummer' }
+    ));
+  } else {
+    ({ error } = await supabaseClient.from('akten_bemerkungen').delete().eq('jahr', year).eq('nummer', num));
+  }
+  if(error){ showToast("Bemerkung konnte nicht gespeichert werden: " + error.message); showSaveFailBanner(); return false; }
+  hideSaveFailBanner();
+  return true;
+}
+// Vollständiges Zurücksetzen aller rechnungsbezogenen Daten - bewusst die EINZIGE Stelle im Programm,
+// die noch kompletttabellen leert. Das ist hier unproblematisch, weil es sich um eine einmalige,
+// im UI extra bestätigte ("Wirklich alle ... löschen?") Aktion handelt und nicht um laufendes
+// Speichern, das mit einer zweiten gleichzeitig arbeitenden Person kollidieren könnte.
+async function resetAllInvoiceData(){
+  if(!pruefeDatenGeladen()) return false;
+  const ops = [
+    ['invoices', q=>q.neq('rechnungsnummer', '__none__')],
+    ['mahnungen', q=>q.neq('rechnungsnummer', '__none__')],
+    ['notizen', q=>q.neq('rechnungsnummer', '__none__')],
+    ['leere_akten_vermerke', q=>q.neq('jahr', -1)],
+    ['akten_bemerkungen', q=>q.neq('jahr', -1)],
+    ['import_log', q=>q.neq('id', -1)]
+  ];
+  for(const [table, applyFilter] of ops){
+    const { error } = await applyFilter(supabaseClient.from(table).delete());
+    if(error){ showToast(`Zurücksetzen fehlgeschlagen bei „${table}": ` + error.message); showSaveFailBanner(); return false; }
+  }
+  pendingInvoiceUpserts.clear();
+  pendingMahnungenInserts = [];
+  pendingNotizenInserts = [];
+  pendingImportLogRow = null;
+  hideSaveFailBanner();
+  return true;
+}
+/* ------------------------------------------------------------
+   Rechnungen + ihre Mahnungen/Notizen-Historie: das ist der Teil, bei dem Full-Resync (alles
+   löschen, alles neu schreiben) tatsächlich riskant war, weil normale Arbeit (Zahlung verbuchen,
+   Notiz schreiben, Mahnung verschicken) häufig passiert und zwei Personen dabei leicht verschiedene
+   Rechnungen gleichzeitig bearbeiten können. Jetzt wird NUR das upgesertet/eingefügt, was sich seit
+   dem letzten Speichern tatsächlich geändert hat (siehe pendingInvoiceUpserts/pendingMahnungenInserts/
+   pendingNotizenInserts oben) - alle anderen, nicht betroffenen Rechnungen bleiben unangetastet.
+   Rechnung + ihre neuen Mahnungen/Notizen werden dabei über die Datenbankfunktion
+   "upsert_invoices_and_history" in EINER Transaktion gespeichert (siehe SQL im Abschlussbericht) -
+   so kann nie der Zustand entstehen, dass die Rechnung zwar aktualisiert, eine neue Mahnung/Notiz
+   dazu aber (z.B. durch einen Verbindungsabbruch mittendrin) nicht mitgespeichert wurde.
+   ------------------------------------------------------------ */
 async function saveData(){
-  try{
-    // Einstellungen (eine feste Zeile, id=1)
-    await supabaseClient.from('settings').update({
-      kanzlei: DATA.settings.kanzlei, ansprech: DATA.settings.ansprech, iban: DATA.settings.iban,
-      frist: DATA.settings.frist, zz_tage: DATA.settings.zzTage
-    }).eq('id', 1);
+  if(!pruefeDatenGeladen()) return false;
+  const mahnungenToSave = pendingMahnungenInserts.slice();
+  const notizenToSave = pendingNotizenInserts.slice();
+  const touchedIds = new Set([
+    ...pendingInvoiceUpserts,
+    ...mahnungenToSave.map(m=>m.rechnungsnummer),
+    ...notizenToSave.map(n=>n.rechnungsnummer)
+  ]);
+  if(touchedIds.size === 0 && !pendingImportLogRow){ hideSaveFailBanner(); return true; }
 
-    // Textvorlagen (komplett ersetzen)
-    await supabaseClient.from('templates').delete().neq('type', '__none__');
-    const templateRows = Object.entries(DATA.templates || {}).map(([type, t])=>({ type, subject: t.subject || "", text: t.text || "" }));
-    if(templateRows.length) await supabaseClient.from('templates').insert(templateRows);
-
-    // "Keine Rechnung erwartet"-Vermerke (komplett ersetzen)
-    await supabaseClient.from('leere_akten_vermerke').delete().neq('jahr', -1);
-    const vermerkeRows = Object.entries(DATA.leereAktenVermerke || {}).map(([key, v])=>{
-      const [jahr, nummer] = key.split('-').map(Number);
-      return { jahr, nummer, keine_rechnung: true, grund: v.grund || "", datum: v.datum || null, wer: v.wer || null };
-    });
-    if(vermerkeRows.length) await supabaseClient.from('leere_akten_vermerke').insert(vermerkeRows);
-
-    // Bemerkungen zu Aktenzeichen (komplett ersetzen)
-    await supabaseClient.from('akten_bemerkungen').delete().neq('jahr', -1);
-    const bemerkungenRows = Object.entries(DATA.aktenBemerkungen || {}).map(([key, b])=>{
-      const [jahr, nummer] = key.split('-').map(Number);
-      return { jahr, nummer, text: b.text, wer: b.wer || null, datum: b.datum || null };
-    });
-    if(bemerkungenRows.length) await supabaseClient.from('akten_bemerkungen').insert(bemerkungenRows);
-
-    // Rechnungen + Mahnungen (komplett ersetzen - Mahnungen werden durch "on delete cascade"
-    // in der Datenbank automatisch mitgelöscht, wenn die zugehörige Rechnung gelöscht wird)
-    await supabaseClient.from('invoices').delete().neq('rechnungsnummer', '__none__');
-    const invoiceRows = DATA.invoices.map(i=>({
+  const invoicesToSave = Array.from(touchedIds).map(rn => DATA.invoices.find(i=>i.rechnungsnummer===rn)).filter(Boolean);
+  const payload = {
+    invoices: invoicesToSave.map(i=>({
       rechnungsnummer: i.rechnungsnummer, aktenzeichen: i.aktenzeichen, mandant: i.mandant || "",
       rechnungsdatum: i.rechnungsdatum || null, zahlungsziel: i.zahlungsziel || null,
       zahlungsziel_geschaetzt: !!i.zahlungszielGeschaetzt, rechnungsbetrag: i.rechnungsbetrag || 0,
@@ -115,37 +257,33 @@ async function saveData(){
       guthaben: i.guthaben || 0, statusdatum: i.statusdatum || null, email: i.email || "",
       manuell_erledigt: !!i.manuellErledigt, manuell_erledigt_grund: i.manuellErledigtGrund || null,
       manuell_erledigt_datum: i.manuellErledigtDatum || null, manuell_erledigt_betrag: i.manuellErledigtBetrag || null,
-      notiz: i.notiz || null
-    }));
-    if(invoiceRows.length) await supabaseClient.from('invoices').insert(invoiceRows);
-
-    const mahnungenRows = [];
-    DATA.invoices.forEach(i=>{
-      (i.mahnungen || []).forEach(m=>{
-        mahnungenRows.push({ rechnungsnummer: i.rechnungsnummer, type: m.type, datum: m.datum, betrag: m.betrag || null, grund: m.grund || null, wer: m.wer || null });
-      });
-    });
-    if(mahnungenRows.length) await supabaseClient.from('mahnungen').insert(mahnungenRows);
-
-    // Notizen-Verlauf (komplett ersetzen)
-    const notizenRows = [];
-    DATA.invoices.forEach(i=>{
-      (i.notizen || []).forEach(n=>{
-        notizenRows.push({ rechnungsnummer: i.rechnungsnummer, text: n.text, wer: n.wer || null, datum: n.datum });
-      });
-    });
-    if(notizenRows.length) await supabaseClient.from('notizen').insert(notizenRows);
-
-    // Import-Verlauf (komplett ersetzen, max. 30 Einträge - siehe handleImportFile)
-    await supabaseClient.from('import_log').delete().neq('id', -1);
-    const importLogRows = (DATA.importLog || []).map(l=>({ filename: l.filename, timestamp: l.timestamp, imported: l.imported, skipped: l.skipped, skipped_details: l.skippedDetails || [], wer: l.wer || null }));
-    if(importLogRows.length) await supabaseClient.from('import_log').insert(importLogRows);
-
-    hideSaveFailBanner();
-  }catch(e){
-    showToast("Speichern fehlgeschlagen: " + e.message);
-    showSaveFailBanner();
+      notiz: i.notiz || null,
+      new_mahnungen: mahnungenToSave.filter(m=>m.rechnungsnummer===i.rechnungsnummer)
+        .map(m=>({ type: m.type, datum: m.datum, betrag: (m.betrag===undefined?null:m.betrag), grund: m.grund||null, wer: m.wer||null })),
+      new_notizen: notizenToSave.filter(n=>n.rechnungsnummer===i.rechnungsnummer)
+        .map(n=>({ text: n.text, wer: n.wer||null, datum: n.datum }))
+    }))
+  };
+  if(pendingImportLogRow){
+    payload.import_log = {
+      filename: pendingImportLogRow.filename, timestamp: pendingImportLogRow.timestamp,
+      imported: pendingImportLogRow.imported, skipped: pendingImportLogRow.skipped,
+      skipped_details: pendingImportLogRow.skippedDetails || [], wer: pendingImportLogRow.wer || null
+    };
   }
+
+  const { error } = await supabaseClient.rpc('upsert_invoices_and_history', { payload });
+  if(error){
+    showToast("Speichern fehlgeschlagen: " + error.message);
+    showSaveFailBanner();
+    return false;
+  }
+  pendingInvoiceUpserts.clear();
+  pendingMahnungenInserts = [];
+  pendingNotizenInserts = [];
+  pendingImportLogRow = null;
+  hideSaveFailBanner();
+  return true;
 }
 // Dauerhafter Hinweis (verschwindet NICHT von selbst wie der Toast), solange eine Änderung nicht
 // gespeichert werden konnte - damit das nicht unbemerkt bleibt und Daten verloren gehen.
@@ -250,15 +388,28 @@ function computeDerived(inv){
       inv.beglichenerBetrag = Math.round((inv.rechnungsbetrag - inv.offenerBetrag)*100)/100;
     }
     inv.offenerBetrag = Math.round(inv.offenerBetrag*100)/100;
-    inv.status = inv.offenerBetrag < 5 ? "beglichen" : (inv.beglichenerBetrag>0 ? "teilweise" : "offen");
+    inv.status = inv.offenerBetrag < BEGLICHEN_SCHWELLE_EUR ? "beglichen" : (inv.beglichenerBetrag>0 ? "teilweise" : "offen");
   }
-  if(!inv.zahlungsziel && inv.rechnungsdatum){ inv.zahlungsziel = addDays(inv.rechnungsdatum, DATA.settings.zzTage || 14); inv.zahlungszielGeschaetzt = true; }
-  else { inv.zahlungszielGeschaetzt = false; }
+  // WICHTIG: zahlungszielGeschaetzt NUR setzen, wenn hier tatsächlich ein Zahlungsziel neu geschätzt
+  // wird (kein Zahlungsziel vorhanden, aber ein Rechnungsdatum). Ist bereits ein Zahlungsziel gesetzt,
+  // bleibt das vorhandene zahlungszielGeschaetzt-Flag UNVERÄNDERT stehen - unabhängig davon, ob dieses
+  // Zahlungsziel selbst geschätzt oder aus dem Import übernommen wurde. Frueher wurde hier bei jedem
+  // erneuten Aufruf (z.B. nach jedem Laden) faelschlich IMMER "false" gesetzt, sobald ein Zahlungsziel
+  // vorhanden war - dadurch "vergass" die App nach kurzer Zeit, dass ein Zahlungsziel nur geschätzt
+  // war, und behandelte es faelschlich wie ein echtes, importiertes Zahlungsziel.
+  if(!inv.zahlungsziel){
+    if(inv.rechnungsdatum){
+      inv.zahlungsziel = addDays(inv.rechnungsdatum, DATA.settings.zzTage || 14);
+      inv.zahlungszielGeschaetzt = true;
+    } else {
+      inv.zahlungszielGeschaetzt = false; // kein Rechnungsdatum vorhanden -> auch keine Schätzung möglich
+    }
+  }
   return inv;
 }
 // Markiert eine Rechnung manuell als erledigt (keine weitere Zahlung erwartet), ohne dass tatsächlich
 // Geld eingegangen ist. Der offene Betrag zählt danach überall (Summen, Prognose, Mahnwesen) als 0.
-function markManuellErledigt(rechnungsnummer, grund){
+async function markManuellErledigt(rechnungsnummer, grund){
   const inv = DATA.invoices.find(i=>i.rechnungsnummer===rechnungsnummer);
   if(!inv || inv.manuellErledigt) return;
   const betrag = inv.offenerBetrag;
@@ -268,12 +419,15 @@ function markManuellErledigt(rechnungsnummer, grund){
   inv.manuellErledigtBetrag = betrag;
   computeDerived(inv);
   inv.mahnungen = inv.mahnungen || [];
-  inv.mahnungen.push({ type:'manuell_erledigt', datum: todayISO(), betrag, grund: inv.manuellErledigtGrund, wer: currentKuerzel() });
-  saveData();
+  const neueMahnung = { type:'manuell_erledigt', datum: todayISO(), betrag, grund: inv.manuellErledigtGrund, wer: currentKuerzel() };
+  inv.mahnungen.push(neueMahnung);
+  pendingInvoiceUpserts.add(rechnungsnummer);
+  pendingMahnungenInserts.push({ ...neueMahnung, rechnungsnummer });
+  await saveData();
   renderAll();
 }
 // Macht die manuelle Erledigt-Markierung rückgängig; der ursprüngliche offene Betrag wird wiederhergestellt.
-function unmarkManuellErledigt(rechnungsnummer){
+async function unmarkManuellErledigt(rechnungsnummer){
   const inv = DATA.invoices.find(i=>i.rechnungsnummer===rechnungsnummer);
   if(!inv || !inv.manuellErledigt) return;
   inv.manuellErledigt = false;
@@ -281,51 +435,60 @@ function unmarkManuellErledigt(rechnungsnummer){
   inv.manuellErledigtGrund = '';
   inv.manuellErledigtBetrag = null;
   computeDerived(inv);
-  saveData();
+  pendingInvoiceUpserts.add(rechnungsnummer);
+  await saveData();
   renderAll();
 }
 // Notiz-Verlauf an einer Rechnung: jede neue Notiz kommt dazu (nichts wird überschrieben),
 // mit Kürzel der angemeldeten Person und Zeitpunkt.
-function addInvoiceNotiz(rechnungsnummer, text){
+async function addInvoiceNotiz(rechnungsnummer, text){
   const trimmed = (text||'').trim();
   if(!trimmed) return;
   const inv = DATA.invoices.find(i=>i.rechnungsnummer===rechnungsnummer);
   if(!inv) return;
   inv.notizen = inv.notizen || [];
-  inv.notizen.push({ text: trimmed, wer: currentKuerzel(), datum: new Date().toISOString() });
-  saveData();
+  const neueNotiz = { text: trimmed, wer: currentKuerzel(), datum: new Date().toISOString() };
+  inv.notizen.push(neueNotiz);
+  pendingNotizenInserts.push({ ...neueNotiz, rechnungsnummer });
+  await saveData();
   renderAll();
 }
 // Vermerk "keine Rechnung zu erwarten" für ein Aktenzeichen ohne hinterlegte Rechnung (Lücken-Zeile
 // in der fortlaufenden Mandanten-Liste). Kommt später doch eine echte Rechnung dazu, wird dieser
 // Vermerk automatisch bedeutungslos, da die Zeile dann keine Lücke mehr ist.
-function setKeineRechnungVermerk(year, num, grund){
+async function setKeineRechnungVermerk(year, num, grund){
   DATA.leereAktenVermerke = DATA.leereAktenVermerke || {};
-  DATA.leereAktenVermerke[year+'-'+num] = { keineRechnung:true, grund:(grund||'').trim(), datum: todayISO(), wer: currentKuerzel() };
-  saveData();
+  const vermerk = { keineRechnung:true, grund:(grund||'').trim(), datum: todayISO(), wer: currentKuerzel() };
+  DATA.leereAktenVermerke[year+'-'+num] = vermerk;
+  await saveVermerk(year, num, vermerk);
   renderAll();
 }
-function clearKeineRechnungVermerk(year, num){
+async function clearKeineRechnungVermerk(year, num){
   if(DATA.leereAktenVermerke) delete DATA.leereAktenVermerke[year+'-'+num];
-  saveData();
+  await saveVermerk(year, num, null);
   renderAll();
 }
 // Frei editierbare Bemerkung zu einem Aktenzeichen (unabhängig davon, ob dazu schon Rechnungen
 // vorliegen) - z.B. "mit Mandant X vereinbart: 500€ Pauschale". Anders als der Notizen-Verlauf bei
 // einzelnen Rechnungen gibt es hier bewusst nur EINE aktuelle Bemerkung, die dauerhaft ersetzt oder
 // gelöscht werden kann (kein Verlauf), weil es hier um einen aktuellen Arbeits-Vermerk geht.
-function setAktenBemerkung(year, num, text){
+async function setAktenBemerkung(year, num, text){
   const key = year+'-'+num;
   const trimmed = (text||'').trim();
   DATA.aktenBemerkungen = DATA.aktenBemerkungen || {};
-  if(!trimmed){ delete DATA.aktenBemerkungen[key]; }
-  else { DATA.aktenBemerkungen[key] = { text: trimmed, wer: currentKuerzel(), datum: new Date().toISOString() }; }
-  saveData();
+  if(!trimmed){
+    delete DATA.aktenBemerkungen[key];
+    await saveBemerkung(year, num, null);
+  } else {
+    const bemerkung = { text: trimmed, wer: currentKuerzel(), datum: new Date().toISOString() };
+    DATA.aktenBemerkungen[key] = bemerkung;
+    await saveBemerkung(year, num, bemerkung);
+  }
   renderAll();
 }
-function deleteAktenBemerkung(year, num){
+async function deleteAktenBemerkung(year, num){
   if(DATA.aktenBemerkungen) delete DATA.aktenBemerkungen[year+'-'+num];
-  saveData();
+  await saveBemerkung(year, num, null);
   renderAll();
 }
 function mahnLabel(type){ return type==='mahnung2' ? '2. Mahnung' : type==='mahnung' ? '1. Mahnung' : type==='zahlung' ? 'Zahlung erhalten' : type==='manuell_erledigt' ? 'Manuell erledigt' : type==='keine_rechnung' ? 'Keine Rechnung erwartet' : 'Erinnerung'; }
@@ -488,6 +651,20 @@ function buildTemplate(inv, type){
   return { subject: fillTemplate(tpl.subject, vars), text: fillTemplate(tpl.text, vars) };
 }
 function escapeHtml(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+// Barrierefreiheit: viele Zeilen/Kacheln in dieser App sind klickbare <div>/<span>/<tr>-Elemente statt
+// echter <button>-Elemente (historisch gewachsen, siehe Code-Review). Ein kompletter Umbau auf <button>
+// würde an vielen Stellen das Erscheinungsbild (Tabellen-Layout, verschachtelte Klicks) durcheinander
+// bringen - stattdessen bekommen diese Elemente beim Rendern das Attribut role="button" + tabindex="0"
+// (siehe die jeweiligen render...()-Funktionen), und dieser EINE zentrale, delegierte Tastatur-Handler
+// sorgt dafür, dass sie sich wie echte Buttons mit Enter/Leertaste bedienen lassen - ohne dass jede
+// einzelne Stelle einen eigenen keydown-Listener bräuchte.
+document.addEventListener('keydown', (e)=>{
+  if(e.key !== 'Enter' && e.key !== ' ') return;
+  const el = e.target.closest('[role="button"]');
+  if(!el) return;
+  e.preventDefault();
+  el.click();
+});
 function showToast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
@@ -534,7 +711,10 @@ async function handleImportFile(file){
     const skippedDetails = [];
     const byId = {};
     DATA.invoices.forEach(inv => byId[inv.rechnungsnummer] = inv);
+    const touchedIds = []; // welche Rechnungen dieser Import tatsächlich angelegt/verändert hat
+    const seenInDieserDatei = new Set(); // erkennt doppelte Rechnungsnummern INNERHALB derselben Datei
     rows.forEach((row, idx)=>{
+      const zeile = idx+2; // Zeile 2 = erste Datenzeile in Excel (Zeile 1 ist die Kopfzeile)
       const get = (...keys)=>{
         for(const k of keys){
           const found = Object.keys(row).find(rk => rk.trim().toLowerCase() === k.toLowerCase());
@@ -542,60 +722,136 @@ async function handleImportFile(file){
         }
         return null;
       };
+      const skip = (grund)=>{ skipped++; skippedDetails.push({ zeile, grund }); };
+
       const rechnungsnummer = get("Rechnungsnummer","Re.-Nr.","Re-Nr","Rechnungs-Nr");
       const aktenzeichen = get("Aktenzeichen","Az","Az.");
-      const betrag = get("Rechnungsbetrag","Re.-Betrag","Re-Betrag");
-      if(!rechnungsnummer || !aktenzeichen || betrag===null || betrag===undefined){
-        skipped++;
-        // Zeile 2 = erste Datenzeile in Excel (Zeile 1 ist die Kopfzeile) - so findet man die
-        // fehlerhafte Zeile beim Nachschauen in der Quelldatei ohne Suchen.
-        const fehlend = [];
-        if(!rechnungsnummer) fehlend.push('Rechnungsnummer');
-        if(!aktenzeichen) fehlend.push('Aktenzeichen');
-        if(betrag===null || betrag===undefined) fehlend.push('Rechnungsbetrag');
-        skippedDetails.push({ zeile: idx+2, grund: `Fehlt: ${fehlend.join(', ')}` });
+      const betragRaw = get("Rechnungsbetrag","Re.-Betrag","Re-Betrag");
+      const fehlend = [];
+      if(!rechnungsnummer) fehlend.push('Rechnungsnummer');
+      if(!aktenzeichen) fehlend.push('Aktenzeichen');
+      if(betragRaw===null || betragRaw===undefined) fehlend.push('Rechnungsbetrag');
+      if(fehlend.length){ skip(`Fehlt: ${fehlend.join(', ')}`); return; }
+
+      if(seenInDieserDatei.has(String(rechnungsnummer))){
+        skip(`Doppelte Rechnungsnummer "${rechnungsnummer}" in dieser Datei - erste Vorkommnis wurde übernommen, diese Zeile übersprungen.`);
         return;
       }
+
+      // Rechnungsbetrag ist ein PFLICHTFELD: ein ungültiger/nicht lesbarer Wert (parseNumberDE liefert
+      // dann null) wird NICHT stillschweigend als 0 € übernommen (das würde aus einem Tippfehler in
+      // Excel unbemerkt eine "beglichene" Rechnung mit 0 € Forderung machen) - die Zeile wird stattdessen
+      // übersprungen und klar gemeldet.
+      const rechnungsbetrag = parseNumberDE(betragRaw);
+      if(rechnungsbetrag === null){ skip(`Ungültiger Rechnungsbetrag: "${betragRaw}"`); return; }
+
       const existing = byId[String(rechnungsnummer)];
+
+      // Für alle optionalen Zahlenfelder gilt dieselbe Regel: "Feld leer/nicht vorhanden" ist erlaubt
+      // (dann gilt der bisherige Wert bzw. 0), "Feld vorhanden, aber nicht lesbar" ist ein Fehler und
+      // führt zum Überspringen der ganzen Zeile, statt den Wert unbemerkt zu verfälschen.
       const nochOffenRaw = get("noch offen","Noch offen","Offener Betrag");
+      let offenerBetrag = null;
+      if(nochOffenRaw !== null){
+        offenerBetrag = parseNumberDE(nochOffenRaw);
+        if(offenerBetrag === null){ skip(`Ungültiger Wert bei "noch offen": "${nochOffenRaw}"`); return; }
+      }
       const guthabenRaw = get("Guthaben");
+      let guthaben = existing ? (existing.guthaben||0) : 0;
+      if(guthabenRaw !== null){
+        const parsed = parseNumberDE(guthabenRaw);
+        if(parsed === null){ skip(`Ungültiger Wert bei "Guthaben": "${guthabenRaw}"`); return; }
+        guthaben = parsed;
+      }
+      const beglichenerRaw = get("Bereits beglichener Betrag","Beglichen");
+      let beglichenerBetrag = 0;
+      if(beglichenerRaw !== null){
+        const parsed = parseNumberDE(beglichenerRaw);
+        if(parsed === null){ skip(`Ungültiger Wert bei "Bereits beglichener Betrag": "${beglichenerRaw}"`); return; }
+        beglichenerBetrag = parsed;
+      }
+
+      // Datumsfelder: "leer" ist erlaubt (Rechnungsdatum ausgenommen - dazu siehe unten), "vorhanden,
+      // aber nicht als Datum lesbar" wird NICHT still zu "kein Datum" - das würde z.B. ein hinterlegtes
+      // Zahlungsziel unbemerkt verschwinden lassen und die Mahnfristen verfälschen.
+      const rechnungsdatumRaw = get("Rechnungsdatum","Datum");
+      let rechnungsdatum = null;
+      if(rechnungsdatumRaw !== null){
+        rechnungsdatum = toISO(rechnungsdatumRaw);
+        if(rechnungsdatum === null){ skip(`Ungültiges Rechnungsdatum: "${rechnungsdatumRaw}"`); return; }
+      }
       const zahlungszielRaw = get("Zahlungsziel","Fälligkeit","Faelligkeit");
+      let zahlungsziel = null, zahlungszielGeschaetzt;
+      if(zahlungszielRaw !== null){
+        zahlungsziel = toISO(zahlungszielRaw);
+        if(zahlungsziel === null){ skip(`Ungültiges Zahlungsziel: "${zahlungszielRaw}"`); return; }
+        zahlungszielGeschaetzt = false; // ein importiertes Zahlungsziel ist per Definition ein ECHTES, kein geschätztes
+      } else if(existing && !existing.zahlungszielGeschaetzt){
+        zahlungsziel = existing.zahlungsziel; // vorhandenes, echtes Zahlungsziel bleibt erhalten
+        zahlungszielGeschaetzt = false;
+      } else {
+        zahlungsziel = null; // wird gleich von computeDerived() neu geschätzt
+        zahlungszielGeschaetzt = undefined;
+      }
+      const statusdatumRaw = get("Statusdatum");
+      let statusdatum = existing ? existing.statusdatum : null;
+      if(statusdatumRaw !== null){
+        const parsed = toISO(statusdatumRaw);
+        if(parsed === null){ skip(`Ungültiges Statusdatum: "${statusdatumRaw}"`); return; }
+        statusdatum = parsed;
+      }
+
       const rec = {
         rechnungsnummer: String(rechnungsnummer),
         aktenzeichen: String(aktenzeichen).trim(),
         mandant: get("Mandant","Empfänger","Empfaenger") || (existing?existing.mandant:"") || "",
-        rechnungsdatum: toISO(get("Rechnungsdatum","Datum")),
-        zahlungsziel: zahlungszielRaw ? toISO(zahlungszielRaw) : (existing ? (existing.zahlungszielGeschaetzt ? null : existing.zahlungsziel) : null),
-        rechnungsbetrag: parseNumberDE(betrag) || 0,
-        offenerBetrag: nochOffenRaw!==null ? (parseNumberDE(nochOffenRaw) || 0) : null,
-        beglichenerBetrag: parseNumberDE(get("Bereits beglichener Betrag","Beglichen")) || 0,
-        guthaben: guthabenRaw!==null ? (parseNumberDE(guthabenRaw) || 0) : (existing ? existing.guthaben||0 : 0),
-        statusdatum: toISO(get("Statusdatum")) || (existing ? existing.statusdatum : null),
+        rechnungsdatum,
+        zahlungsziel, zahlungszielGeschaetzt,
+        rechnungsbetrag,
+        offenerBetrag,
+        beglichenerBetrag,
+        guthaben,
+        statusdatum,
         email: get("E-Mail Rechnungsempfaenger","E-Mail Rechnungsempfänger","E-Mail") || (existing?existing.email:"") || "",
+        // Notizen/Mahnverlauf aus einer früheren Rechnung mit derselben Rechnungsnummer bleiben beim
+        // erneuten Import vollständig erhalten (werden hier nur kopiert, nicht verworfen).
         mahnungen: existing ? existing.mahnungen.slice() : [],
         notizen: existing ? (existing.notizen||[]).slice() : []
       };
       computeDerived(rec);
       // Automatische Zahlungserkennung: ist der offene Betrag gegenüber dem letzten Import gesunken,
       // wurde eine Rate gezahlt -> als Ereignis vermerken. Das setzt die Mahnkette für den naechsten
-      // Zyklus automatisch zurueck (siehe getMahnStatus).
+      // Zyklus automatisch zurueck (siehe getMahnStatus). Die 1-Cent-Toleranz (-0.01) verhindert, dass
+      // reine Rundungsdifferenzen fälschlich als Zahlung erkannt werden.
+      let neueMahnung = null;
       if(existing && rec.offenerBetrag < existing.offenerBetrag - 0.01){
         const betragGezahlt = Math.round((existing.offenerBetrag - rec.offenerBetrag)*100)/100;
         const zahlungNeuerAlsBekannt = rec.statusdatum && (!existing.statusdatum || rec.statusdatum > existing.statusdatum);
         const zahlungsdatum = zahlungNeuerAlsBekannt ? rec.statusdatum : todayISO();
-        rec.mahnungen.push({ type: 'zahlung', datum: zahlungsdatum, betrag: betragGezahlt, wer: currentKuerzel() });
+        neueMahnung = { type: 'zahlung', datum: zahlungsdatum, betrag: betragGezahlt, wer: currentKuerzel() };
+        rec.mahnungen.push(neueMahnung);
         rec.mahnungen.sort((a,b)=> a.datum.localeCompare(b.datum));
       }
       byId[rec.rechnungsnummer] = rec;
+      seenInDieserDatei.add(rec.rechnungsnummer);
+      touchedIds.push(rec.rechnungsnummer);
+      if(neueMahnung) pendingMahnungenInserts.push({ ...neueMahnung, rechnungsnummer: rec.rechnungsnummer });
       imported++;
     });
     DATA.invoices = Object.values(byId);
     DATA.lastImport = new Date().toISOString();
-    DATA.importLog.unshift({ filename: file.name, timestamp: DATA.lastImport, imported, skipped, skippedDetails, wer: currentKuerzel() });
+    const importLogEintrag = { filename: file.name, timestamp: DATA.lastImport, imported, skipped, skippedDetails, wer: currentKuerzel() };
+    DATA.importLog.unshift(importLogEintrag);
     DATA.importLog = DATA.importLog.slice(0, 30);
-    await saveData();
+    touchedIds.forEach(id => pendingInvoiceUpserts.add(id));
+    pendingImportLogRow = importLogEintrag;
+    const ok = await saveData();
     renderAll();
-    showToast(`Import abgeschlossen: ${imported} Rechnung(en) übernommen${skipped?`, ${skipped} Zeile(n) übersprungen`:''}.`);
+    if(ok){
+      showToast(`Import abgeschlossen: ${imported} Rechnung(en) übernommen${skipped?`, ${skipped} Zeile(n) übersprungen`:''}.`);
+    } else {
+      showToast(`Import verarbeitet, aber NICHT gespeichert (siehe Hinweisbanner oben) - bitte erneut versuchen.`);
+    }
   }catch(err){
     showToast("Fehler beim Import: " + err.message);
   }
@@ -609,8 +865,11 @@ document.getElementById('resetBtn').addEventListener('click', async ()=>{
   // und Akten-Bemerkungen zu Aktenzeichen, da diese sonst im Archiv/Verlauf sichtbar stehen bleiben
   // würden, obwohl keine Rechnungsdaten mehr vorhanden sind. Einstellungen, Textvorlagen und der
   // Login-Name bleiben davon bewusst unberührt (siehe Button-Name "Rechnungsdaten zurücksetzen").
+  const ok = await resetAllInvoiceData();
+  if(!ok) return; // Fehler wurde bereits per Toast/Banner gemeldet - DATA NICHT leeren, sonst zeigt die
+                   // Oberfläche "keine Daten" an, obwohl in der Datenbank eventuell noch welche stehen.
   DATA.invoices = []; DATA.lastImport = null; DATA.importLog = []; DATA.leereAktenVermerke = {}; DATA.aktenBemerkungen = {};
-  await saveData(); logActivity('Rechnungsdaten zurückgesetzt'); showView('dashboard'); renderAll();
+  logActivity('Rechnungsdaten zurückgesetzt'); showView('dashboard'); renderAll();
 });
 document.getElementById('exportBtn').addEventListener('click', ()=>{
   const rows = DATA.invoices.map(i=>({
@@ -670,7 +929,7 @@ function renderTopSearchResults(query){
     });
     const matches = Object.values(map).slice(0,8);
     box.innerHTML = matches.length ? matches.map(m=>`
-      <div class="topsearch-item" data-az="${escapeHtml(m.aktenzeichen)}">
+      <div class="topsearch-item" data-az="${escapeHtml(m.aktenzeichen)}" role="button" tabindex="0" aria-label="Akte ${escapeHtml(m.aktenzeichen)} öffnen">
         <span class="topsearch-az">${escapeHtml(m.aktenzeichen)}</span>
         <span class="topsearch-name">${escapeHtml(m.mandant||'–')}</span>
         <span class="topsearch-amount">${fmtEUR(m.offen)}</span>
@@ -700,8 +959,8 @@ document.getElementById('topSearch').addEventListener('focus', (e)=>{ if(e.targe
 document.addEventListener('click', (e)=>{
   if(!e.target.closest('.topbar-search')) document.getElementById('topSearchResults').classList.remove('show');
 });
-document.getElementById('chipOverdue').addEventListener('click', (e)=>{ e.currentTarget.classList.toggle('active'); renderRechnungen(); });
-document.getElementById('chipMahn').addEventListener('click', (e)=>{ e.currentTarget.classList.toggle('active'); renderRechnungen(); });
+document.getElementById('chipOverdue').addEventListener('click', (e)=>{ const on=e.currentTarget.classList.toggle('active'); e.currentTarget.setAttribute('aria-pressed', String(on)); renderRechnungen(); });
+document.getElementById('chipMahn').addEventListener('click', (e)=>{ const on=e.currentTarget.classList.toggle('active'); e.currentTarget.setAttribute('aria-pressed', String(on)); renderRechnungen(); });
 document.querySelectorAll('.sortbtn').forEach(btn=>{
   btn.addEventListener('click', ()=>{
     const mode = btn.getAttribute('data-sort');
@@ -860,7 +1119,7 @@ function renderDashboardChartsInner(chartsBox, insightsBox){
     const pillColor = ms.naechsterSchrittFaellig ? 'var(--red)' : 'var(--text2)';
     const pillBg = ms.naechsterSchrittFaellig ? 'var(--red-soft)' : 'var(--surface2)';
     const statusTxt = ms.naechsterSchrittFaellig ? 'fällig' : `ab ${fmtDate(ms.deadline)}`;
-    return `<div class="insight-item" data-az="${escapeHtml(inv.aktenzeichen)}">
+    return `<div class="insight-item" data-az="${escapeHtml(inv.aktenzeichen)}" role="button" tabindex="0" aria-label="Akte ${escapeHtml(inv.aktenzeichen)} öffnen">
       <div><div class="insight-main">${escapeHtml(inv.mandant||inv.aktenzeichen)}</div>
         <div class="insight-meta">${escapeHtml(inv.aktenzeichen)} · ${label}</div></div>
       <div class="insight-right"><span class="insight-pill" style="color:${pillColor};background:${pillBg};">${statusTxt}</span></div>
@@ -869,7 +1128,7 @@ function renderDashboardChartsInner(chartsBox, insightsBox){
   const critical = offen.filter(isOverdue).map(inv=>{
     return {inv, days: daysOverdue(inv)};
   }).sort((a,b)=> b.days - a.days).slice(0,5).map(({inv,days})=>`
-    <div class="insight-item" data-az="${escapeHtml(inv.aktenzeichen)}">
+    <div class="insight-item" data-az="${escapeHtml(inv.aktenzeichen)}" role="button" tabindex="0" aria-label="Akte ${escapeHtml(inv.aktenzeichen)} öffnen">
       <div><div class="insight-main">${escapeHtml(inv.mandant||inv.aktenzeichen)}</div>
         <div class="insight-meta">${escapeHtml(inv.aktenzeichen)} · ${days>0?days+' Tage überfällig':'überfällig'}</div></div>
       <div class="insight-right"><div class="insight-amount">${fmtEUR(inv.offenerBetrag)}</div></div>
@@ -1064,7 +1323,7 @@ function renderRechnungen(){
     const isSettled = sumOffen < 5;
     const azTagStyle = isSettled ? ' style="color:var(--green);border-color:var(--green);"' : '';
     return `
-    <div class="akte-row" data-az="${escapeHtml(g.aktenzeichen)}">
+    <div class="akte-row" data-az="${escapeHtml(g.aktenzeichen)}" role="button" tabindex="0" aria-label="Akte ${escapeHtml(g.aktenzeichen)} öffnen">
       <span class="az-tag"${azTagStyle}>${escapeHtml(g.aktenzeichen)}</span>
       <span class="akte-mandant">${escapeHtml(g.mandant||'–')}</span>
       <span class="akte-meta">${g.invoices.length} Rechnung${g.invoices.length>1?'en':''}${!hasEmail?' · E-Mail fehlt':''}</span>
@@ -1157,7 +1416,7 @@ function renderMandanten(){
       const bemerkung = (DATA.aktenBemerkungen || {})[vermerkKey];
       rowsHtml += `
       <div class="mandant-card">
-        <div class="mandant-row" data-toggle="${panelId}">
+        <div class="mandant-row" data-toggle="${panelId}" role="button" tabindex="0" aria-expanded="false">
           <span class="az-tag"${azTagStyleGap}>${n}/${yearShort}</span>
           <span class="mandant-name"></span>
           <span class="akte-meta" style="font-style:italic;">${isNoRe ? 'Keine Rechnung erwartet' + (vermerk.grund ? ` – ${escapeHtml(vermerk.grund)}` : '') + (vermerk.wer ? ` (${escapeHtml(vermerk.wer)}, ${fmtDate(vermerk.datum)})` : '') : '– kein Vorgang hinterlegt –'}${bemerkung ? ' · 📌 Bemerkung' : ''}</span>
@@ -1187,7 +1446,7 @@ function renderMandanten(){
     const azTagStyle = isSettled ? ' style="color:var(--green);border-color:var(--green);"' : '';
     rowsHtml += `
     <div class="mandant-card">
-      <div class="mandant-row" data-toggle="${panelId}">
+      <div class="mandant-row" data-toggle="${panelId}" role="button" tabindex="0" aria-expanded="false">
         <span class="az-tag"${azTagStyle}>${n}/${yearShort}</span>
         <span class="mandant-name">${escapeHtml(name)}</span>
         <span class="akte-meta">${g.invoices.length} Rechnung${g.invoices.length>1?'en':''}${(DATA.aktenBemerkungen||{})[selectedAzYear + '-' + n] ? ' · 📌 Bemerkung' : ''}</span>
@@ -1198,7 +1457,7 @@ function renderMandanten(){
         <span class="mandant-caret" id="caret-${panelId}">▾</span>
       </div>
       <div class="mandant-akten" id="${panelId}" style="display:none;">
-        <div class="akte-row akte-row-nested" data-az="${escapeHtml(g.az)}">
+        <div class="akte-row akte-row-nested" data-az="${escapeHtml(g.az)}" role="button" tabindex="0" aria-label="Akte ${escapeHtml(g.az)} öffnen">
           <span class="az-tag"${azTagStyle}>${escapeHtml(g.az)}</span>
           <span class="akte-meta">${escapeHtml(name)} · ${g.invoices.length} Rechnung${g.invoices.length>1?'en':''}</span>
           <div class="sums">
@@ -1223,6 +1482,7 @@ function renderMandanten(){
       const open = panel.style.display !== 'none';
       panel.style.display = open ? 'none' : 'block';
       caret.textContent = open ? '▾' : '▴';
+      el.setAttribute('aria-expanded', open ? 'false' : 'true');
     });
   });
   box.querySelectorAll('[data-az]').forEach(el=>{
@@ -1297,7 +1557,7 @@ function renderMahnwesen(){
     <tbody>${list.map(({inv,ms})=>{
       const label = ms.nextStep==='erinnerung' ? 'Zahlungserinnerung' : ms.nextStep==='inkasso' ? 'Mahnbescheid prüfen' : mahnLabel(ms.nextStep);
       const statusTxt = ms.naechsterSchrittFaellig ? `<span class="hist due">fällig seit ${fmtDate(ms.deadline)}</span>` : `<span class="hist">ab ${fmtDate(ms.deadline)}</span>`;
-      return `<tr data-az="${escapeHtml(inv.aktenzeichen)}" style="cursor:pointer;">
+      return `<tr data-az="${escapeHtml(inv.aktenzeichen)}" style="cursor:pointer;" role="button" tabindex="0" aria-label="Akte ${escapeHtml(inv.aktenzeichen)} öffnen">
         <td>${escapeHtml(inv.mandant||'–')}</td>
         <td class="rn">${escapeHtml(inv.aktenzeichen)}</td>
         <td class="amount">${fmtEUR(inv.offenerBetrag)}</td>
@@ -1337,7 +1597,7 @@ function renderMahnwesen(){
     el.addEventListener('click', ()=> openAkteDetail(el.getAttribute('data-az')));
   });
 }
-document.getElementById('mahnOnlyFaellig').addEventListener('click', (e)=>{ e.currentTarget.classList.toggle('active'); renderMahnwesen(); });
+document.getElementById('mahnOnlyFaellig').addEventListener('click', (e)=>{ const on=e.currentTarget.classList.toggle('active'); e.currentTarget.setAttribute('aria-pressed', String(on)); renderMahnwesen(); });
 document.getElementById('mahnStufeFilter').addEventListener('change', renderMahnwesen);
 function renderReports(){
   document.getElementById('repCount').textContent = DATA.invoices.length + " Rechnungen";
@@ -1408,12 +1668,12 @@ function openAkteDetail(az){
   const emailEl = document.getElementById('detailEmail');
   emailEl.textContent = "✉ " + (email || "E-Mail-Adresse hinterlegen");
   emailEl.className = "email-link" + (email ? "" : " missing");
-  emailEl.onclick = ()=>{
+  emailEl.onclick = async ()=>{
     const current = invoices.find(i=>i.email)?.email || "";
     const value = prompt(`E-Mail-Adresse für Akte ${az} (gilt für alle Rechnungen dieser Akte):`, current);
     if(value === null) return;
-    DATA.invoices.forEach(i=>{ if(i.aktenzeichen===az) i.email = value.trim(); });
-    saveData(); openAkteDetail(az);
+    DATA.invoices.forEach(i=>{ if(i.aktenzeichen===az){ i.email = value.trim(); pendingInvoiceUpserts.add(i.rechnungsnummer); } });
+    await saveData(); openAkteDetail(az);
   };
   const sumBetrag = invoices.reduce((s,i)=>s+i.rechnungsbetrag,0);
   const sumOffen = invoices.reduce((s,i)=>s+i.offenerBetrag,0);
@@ -1548,7 +1808,7 @@ function renderArchiv(){
       const extra = isVermerk && d.grund ? ` – ${escapeHtml(d.grund)}` : '';
       const azCell = d.synthetic
         ? `<span style="font-family:'IBM Plex Mono',monospace;color:var(--text2);">${escapeHtml(d.aktenzeichen)}</span>`
-        : `<span class="archiv-az" data-archaz="${escapeHtml(d.aktenzeichen)}" style="font-family:'IBM Plex Mono',monospace;color:var(--accent);cursor:pointer;">${escapeHtml(d.aktenzeichen)}</span>`;
+        : `<span class="archiv-az" data-archaz="${escapeHtml(d.aktenzeichen)}" style="font-family:'IBM Plex Mono',monospace;color:var(--accent);cursor:pointer;" role="button" tabindex="0" aria-label="Akte ${escapeHtml(d.aktenzeichen)} öffnen">${escapeHtml(d.aktenzeichen)}</span>`;
       return `
       <tr>
         <td>${fmtDate(d.datum)}</td>
@@ -1625,7 +1885,8 @@ document.getElementById('saveTplBtn').addEventListener('click', async ()=>{
       text: document.getElementById('tplText_'+type).value
     };
   });
-  await saveData();
+  const ok = await saveTemplates();
+  if(!ok) return; // Fehler bereits per Toast/Banner gemeldet
   logActivity('Textvorlagen geändert');
   showToast("Vorlagen gespeichert.");
 });
@@ -1637,7 +1898,17 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async ()=>{
     frist: document.getElementById('setFrist').value.trim() || "10",
     zzTage: document.getElementById('setZzTage').value.trim() || "14"
   };
-  DATA.invoices.forEach(inv=>{ if(inv.zahlungszielGeschaetzt) inv.zahlungsziel = null; computeDerived(inv); });
+  const okSettings = await saveSettings();
+  if(!okSettings) return; // Fehler bereits per Toast/Banner gemeldet
+  // Nur die GESCHÄTZTEN Zahlungsziele mit der neuen Standard-Frist neu berechnen - ein importiertes,
+  // echtes Zahlungsziel (zahlungszielGeschaetzt === false) bleibt unangetastet (siehe computeDerived()).
+  DATA.invoices.forEach(inv=>{
+    if(inv.zahlungszielGeschaetzt){
+      inv.zahlungsziel = null;
+      computeDerived(inv);
+      pendingInvoiceUpserts.add(inv.rechnungsnummer);
+    }
+  });
   await saveData();
   logActivity('Einstellungen geändert');
   renderAll();
@@ -1670,8 +1941,11 @@ document.getElementById('sendReminderBtn').addEventListener('click', async ()=>{
   window.open(`mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`, '_blank');
   const { inv, type } = activeInvoiceForReminder;
   inv.mahnungen = inv.mahnungen || [];
-  inv.mahnungen.push({ type, datum: todayISO(), wer: currentKuerzel() });
+  const neueMahnung = { type, datum: todayISO(), wer: currentKuerzel() };
+  inv.mahnungen.push(neueMahnung);
   inv.email = email;
+  pendingInvoiceUpserts.add(inv.rechnungsnummer);
+  pendingMahnungenInserts.push({ ...neueMahnung, rechnungsnummer: inv.rechnungsnummer });
   await saveData();
   document.getElementById('reminderModal').classList.remove('show');
   const activeView = document.querySelector('.view.active');
@@ -1717,9 +1991,11 @@ function currentKuerzel(){ return activeUserName ? initials(activeUserName) : "?
 // Schreibt einen Eintrag in das allgemeine Aktivitätsprotokoll (nicht an eine einzelne
 // Rechnung gebunden, z.B. Einstellungen/Vorlagen geändert, Daten zurückgesetzt).
 async function logActivity(aktion, details){
-  try{
-    await supabaseClient.from('activity_log').insert({ wer: currentKuerzel(), aktion, details: details||null });
-  }catch(e){ console.warn("Aktivitätsprotokoll konnte nicht geschrieben werden:", e); }
+  const { error } = await supabaseClient.from('activity_log').insert({ wer: currentKuerzel(), aktion, details: details||null });
+  // Ein fehlgeschlagener Protokoll-Eintrag ist nicht kritisch genug, um die eigentliche Aktion
+  // (die bereits gespeichert wurde) rückgängig zu machen oder die Person zu stören - wird aber nicht
+  // mehr stillschweigend verschluckt, sondern wenigstens in der Konsole sichtbar gemacht.
+  if(error) console.warn("Aktivitätsprotokoll konnte nicht geschrieben werden:", error.message);
 }
 function renderUserChip(){
   if(activeUserName){
@@ -1734,8 +2010,13 @@ function renderUserChip(){
 }
 document.getElementById('userChip').addEventListener('click', async ()=>{
   if(!confirm(`Abmelden${activeUserName?' ('+activeUserName+')':''}?`)) return;
-  await supabaseClient.auth.signOut();
+  const { error } = await supabaseClient.auth.signOut();
+  // sessionStorage IMMER löschen, auch wenn signOut() einen Fehler meldet (z.B. kein Netzwerk) -
+  // sonst könnte die zwischengespeicherte Kennung stehen bleiben, obwohl die eigentliche Anmeldung
+  // bei Supabase evtl. schon ungültig ist. Danach wird so oder so neu geladen, was den tatsächlichen
+  // Anmeldestatus bei Supabase erneut (serverseitig) prüft (siehe initAuthGate()).
   sessionStorage.removeItem(ACTIVE_USER_KEY);
+  if(error) console.warn("Abmelden bei Supabase meldete einen Fehler (lokal trotzdem abgemeldet):", error.message);
   location.reload();
 });
 
@@ -1785,9 +2066,21 @@ document.getElementById('authSubmitBtn').addEventListener('click', async ()=>{
   if(!password){ showAuthError('Bitte Passwort eingeben.'); return; }
   const btn = document.getElementById('authSubmitBtn');
   btn.disabled = true; btn.textContent = 'Prüfe…';
-  const { error } = await supabaseClient.auth.signInWithPassword({ email: selectedTeamMember.email, password });
+  let error;
+  try{
+    ({ error } = await supabaseClient.auth.signInWithPassword({ email: selectedTeamMember.email, password }));
+  }catch(networkErr){
+    // Ein Netzwerk-/Verbindungsfehler wirft hier tatsächlich eine Exception (anders als bei den
+    // meisten anderen Supabase-Aufrufen) - wird separat abgefangen, damit die Person nicht
+    // fälschlich "Passwort falsch" liest, wenn in Wahrheit die Internetverbindung fehlt.
+    btn.disabled = false; btn.textContent = 'Anmelden';
+    showAuthError('Anmeldung fehlgeschlagen - bitte Internetverbindung prüfen und erneut versuchen.');
+    return;
+  }
   btn.disabled = false; btn.textContent = 'Anmelden';
-  if(error){ showAuthError('Passwort falsch.'); return; }
+  if(error){ showAuthError(/network|fetch/i.test(error.message||'') ? 'Anmeldung fehlgeschlagen - bitte Internetverbindung prüfen.' : 'Passwort falsch.'); return; }
+  // Die angezeigte Kennung kommt bewusst aus selectedTeamMember (also aus der Liste, gegen die das
+  // Passwort gerade serverseitig geprüft wurde) - nicht aus einem frei beschreibbaren Feld.
   activeUserName = selectedTeamMember.name;
   sessionStorage.setItem(ACTIVE_USER_KEY, activeUserName);
   document.getElementById('authGate').classList.remove('show');
@@ -1803,11 +2096,29 @@ async function startApp(){
 // Beim (Neu-)Laden der Seite prüfen, ob bereits eine gültige Supabase-Sitzung besteht.
 (async function initAuthGate(){
   renderUserList();
-  const { data: { session } } = await supabaseClient.auth.getSession();
+  let session = null;
+  try{
+    const res = await supabaseClient.auth.getSession();
+    if(res.error) throw res.error;
+    session = res.data.session;
+  }catch(e){
+    console.warn("Sitzungsstatus konnte nicht geprüft werden (z.B. kein Netzwerk):", e);
+    showToast("Verbindung zur Anmeldung konnte nicht geprüft werden. Bitte Internetverbindung prüfen und die Seite neu laden.");
+    // sonst: Namensauswahl bleibt sichtbar - die Person kann es erneut versuchen, statt dass die
+    // App fälschlich von "nicht angemeldet" ausgeht und eine neue, unnötige Anmeldung verlangt.
+  }
   if(session){
-    const saved = sessionStorage.getItem(ACTIVE_USER_KEY);
+    // WICHTIG: die angezeigte/protokollierte Kennung richtet sich nach der ECHTEN, serverseitig
+    // bestätigten Supabase-Sitzung (session.user.email) - NICHT nach dem in sessionStorage
+    // zwischengespeicherten Namen. sessionStorage ist im Browser durch die Person selbst (z.B. über
+    // die Entwicklertools) veränderbar; würde er Vorrang haben, könnte sich jemand im
+    // Aktivitätsprotokoll fälschlich als die jeweils andere Person ausgeben, obwohl er sich mit dem
+    // eigenen Konto angemeldet hat. Der gespeicherte Name dient nur noch als Rückfallebene, falls die
+    // angemeldete E-Mail aus irgendeinem Grund keinem TEAM-Eintrag entspricht.
     const match = TEAM.find(u => u.email.toLowerCase() === (session.user.email||'').toLowerCase());
-    activeUserName = saved || (match ? match.name : (session.user.email||'Angemeldet'));
+    const saved = sessionStorage.getItem(ACTIVE_USER_KEY);
+    activeUserName = match ? match.name : (saved || session.user.email || 'Angemeldet');
+    sessionStorage.setItem(ACTIVE_USER_KEY, activeUserName);
     document.getElementById('authGate').classList.remove('show');
     renderUserChip();
     startApp();
